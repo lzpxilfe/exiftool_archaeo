@@ -276,25 +276,13 @@ def run_gui():
                command=lambda: v_map_path.set(browse_map())).grid(
                row=0, column=2)
 
-    # exiftool 경로
-    def browse_exiftool():
-        f = filedialog.askopenfilename(
-            title="exiftool.exe 선택",
-            filetypes=[("실행 파일", "*.exe"), ("모든 파일", "*.*")])
-        return f or ""
-
-    v_exiftool = make_row(sec2, "ExifTool 경로", 3, browse_exiftool, "찾아보기")
-    
-    status_label = tk.Label(sec2, text="", bg=PANEL, fg=TEXT, font=("Segoe UI", 9))
-    status_label.grid(row=4, column=1, sticky="w")
-    
-    # 자동 탐색 및 상태 표시
+    # ExifTool 경로는 백그라운드에서 자동 탐색하므로 UI에서 제외
+    v_exiftool = tk.StringVar()
     try:
         auto_et = find_exiftool(None)
         v_exiftool.set(auto_et)
-        status_label.configure(text="✔ 자동 감지 성공: exiftool이 준비되었습니다.", fg="#48bb78", bg=PANEL)
     except FileNotFoundError:
-        status_label.configure(text="⚠ 감지 실패: 같은 폴더에 exiftool.exe를 넣어주거나 직접 선택해 주세요.", fg="#f6ad55", bg=PANEL)
+        pass
 
     # § 섹션 3 — 실행 버튼
     btn_frame = ttk.Frame(body)
@@ -372,6 +360,17 @@ def run_gui():
         crs_label = v_crs.get()
         crs_code = next((c[1] for c in CRS_OPTIONS if c[0] == crs_label), "tm")
         target_crs = CRS_PRESETS.get(crs_code, crs_code)
+
+        # ExifTool 감지 여부 실시간 확인 및 안내
+        try:
+            find_exiftool(v_exiftool.get().strip() or None)
+        except FileNotFoundError:
+            messagebox.showerror(
+                "ExifTool 누락",
+                "exiftool.exe를 찾을 수 없습니다.\n\n"
+                "ExifToolArchaeo.exe 실행 파일과 동일한 폴더에 exiftool.exe 파일을 복사해서 넣어주십시오."
+            )
+            return
 
         et_path_hint = v_exiftool.get().strip() or None
 
