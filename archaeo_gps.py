@@ -451,6 +451,7 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
 
 
 
+
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
@@ -460,7 +461,7 @@ def write_map(records: list[dict], output_path: str):
     Generate a Leaflet.js HTML map with:
       - Side panel layout
       - Zoomable/Pannable photo Lightbox using mouse scroll wheel and drag
-      - Tile layers with custom CSS opacity and blend-mode (multiply) mix
+      - Clean tile layer choices including Vworld layers (Esri Satellite, OSM, Vworld layers)
       - Nadir target icons for vertical shots (Pitch <= -85)
     """
 
@@ -683,12 +684,6 @@ def write_map(records: list[dict], output_path: str):
       z-index: 10000;
       pointer-events: none;
     }}
-
-    /* ── Leaflet CSS Multiply (곱하기) 융합 레이어 스타일 ── */
-    .blend-multiply {{
-      mix-blend-mode: multiply;
-      filter: contrast(1.1) brightness(0.95);
-    }}
   </style>
 </head>
 <body>
@@ -728,8 +723,8 @@ def write_map(records: list[dict], output_path: str):
       zoomControl: true
     }}).setView([{center_lat}, {center_lon}], 16);
 
-    // ── 베이스 레이어 및 오버레이 (곱하기 융합 및 투명도 조절 지원) ──
-    const satellite = L.tileLayer(
+    // ── 베이스 레이어 및 오버레이 ──
+    const esriSatellite = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
       {{ 
         attribution: 'Tiles &copy; Esri', 
@@ -747,6 +742,34 @@ def write_map(records: list[dict], output_path: str):
       }}
     );
 
+    // Vworld layers (브이월드 복원)
+    const vworldSatellite = L.tileLayer(
+      'https://xdworld.vworld.kr/2d/Satellite/service/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: 'Vworld', 
+        maxNativeZoom: 18, 
+        maxZoom: 22 
+      }}
+    );
+
+    const vworldHybrid = L.tileLayer(
+      'https://xdworld.vworld.kr/2d/Hybrid/service/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: 'Vworld', 
+        maxNativeZoom: 18, 
+        maxZoom: 22 
+      }}
+    );
+
+    const vworldBase = L.tileLayer(
+      'https://xdworld.vworld.kr/2d/Base/service/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: 'Vworld', 
+        maxNativeZoom: 18, 
+        maxZoom: 22 
+      }}
+    );
+
     const osm = L.tileLayer(
       'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
       {{ 
@@ -756,38 +779,25 @@ def write_map(records: list[dict], output_path: str):
       }}
     );
 
-    // 1. 위성 하이브리드 조합 레이어 (Esri 위성 + CartoDB 라벨)
-    const hybrid = L.layerGroup([satellite, labels]);
+    // 조합 레이어 정의
+    const vworldCombo = L.layerGroup([vworldSatellite, vworldHybrid]);
+    const esriCombo = L.layerGroup([esriSatellite, labels]);
 
-    // 2. OSM 곱하기 융합 레이어 (위성 위에 얹을 수도 있고 단독 사용도 가능하도록)
-    // CSS mix-blend-mode: multiply와 opacity: 0.65를 조합하여 위성사진과 완벽 융합
-    const osmMultiply = L.tileLayer(
-      'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: '&copy; OSM', 
-        maxNativeZoom: 19, 
-        maxZoom: 22,
-        className: 'blend-multiply',
-        opacity: 0.65
-      }}
-    );
-
-    // 곱하기 하이브리드 조합 레이어 (Esri 위성 + OSM 곱하기 오버레이)
-    const multiplyCombo = L.layerGroup([satellite, osmMultiply]);
-
-    // 기본 레이어로 일반 위성 하이브리드 적용
-    hybrid.addTo(map);
+    // 기본 레이어로 브이월드 하이브리드 조합 맵 적용
+    vworldCombo.addTo(map);
 
     L.control.layers(
       {{ 
-        "🛰 위성 하이브리드 (위성+라벨)": hybrid,
-        "✖ 위성+OSM 곱하기 융합 (Multiply)": multiplyCombo,
-        "🛰 위성 단독": satellite,
+        "🛰 브이월드 하이브리드 (위성+라벨)": vworldCombo,
+        "🛰 브이월드 위성": vworldSatellite,
+        "🗺 브이월드 일반지도": vworldBase,
+        "🛰 Esri 위성 하이브리드": esriCombo,
+        "🛰 Esri 위성 단독": esriSatellite,
         "🗺 일반 지도 (OSM)": osm 
       }},
       {{ 
-        "🏷 지명/도로명 라벨 (단독 토글)": labels,
-        "✖ OSM 곱하기 레이어 (개별 오버레이)": osmMultiply 
+        "🏷 브이월드 도로/지명 라벨 (단독 토글)": vworldHybrid,
+        "🏷 CartoDB 라벨 (단독 토글)": labels 
       }},
       {{ position: 'topright', collapsed: false }}
     ).addTo(map);
@@ -934,7 +944,6 @@ def write_map(records: list[dict], output_path: str):
             <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
             <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
             <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">짐벌 Roll</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_roll}}</td></tr>
             <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
             <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
           </table>
