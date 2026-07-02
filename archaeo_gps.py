@@ -178,41 +178,58 @@ def normalize_yaw(yaw: float | None) -> float | None:
 
 
 def find_exiftool(hint: str | None) -> str:
-    """Locate exiftool executable.
-    Search order:
-      1. hint (--exiftool argument)
-      2. Same folder as the running exe (PyInstaller frozen build)
-      3. Same folder as this script
-      4. System PATH
-    """
+    """Locate exiftool executable with strict validation for split perl packages (exiftool_files)."""
     import shutil
     
-    if hint:
-        if Path(hint).is_file():
-            return str(Path(hint).resolve().absolute())
-        w = shutil.which(hint)
-        if w:
-            return str(Path(w).resolve().absolute())
+    def is_valid_exiftool(path_str: str) -> bool:
+        p = Path(path_str)
+        if not p.is_file():
+            return False
+            
+        parent_dir = p.parent
+        has_files_dir = (parent_dir / "exiftool_files").is_dir()
+        
+        # 분리형인데 폴더가 없거나 단독형인데 내부 Perl DLL 손상이 의심되는 경우 자가 검증 실행
+        if p.name.lower() in ("exiftool.exe", "exiftool") and not has_files_dir:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            try:
+                res = subprocess.run(
+                    [str(p.resolve().absolute()), "-echo", "OK"],
+                    capture_output=True, text=True, timeout=3,
+                    startupinfo=startupinfo
+                )
+                if "OK" not in res.stdout:
+                    return False
+            except Exception:
+                return False
+        return True
 
-    # PyInstaller frozen exe: look next to the .exe first
+    # 1. 힌트 경로 검사
+    if hint and is_valid_exiftool(hint):
+        return str(Path(hint).resolve().absolute())
+
+    # 2. 실행 파일(exe)과 같은 디렉토리 (PyInstaller frozen)
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
         for name in ["exiftool.exe", "exiftool"]:
             target = exe_dir / name
-            if target.is_file():
+            if is_valid_exiftool(str(target)):
                 return str(target.resolve().absolute())
 
-    # Script directory
+    # 3. 스크립트 디렉토리
     script_dir = Path(__file__).parent
     for name in ["exiftool.exe", "exiftool"]:
         target = script_dir / name
-        if target.is_file():
+        if is_valid_exiftool(str(target)):
             return str(target.resolve().absolute())
 
-    # System PATH
+    # 4. 시스템 PATH
     for name in ["exiftool.exe", "exiftool"]:
         w = shutil.which(name)
-        if w:
+        if w and is_valid_exiftool(w):
             return str(Path(w).resolve().absolute())
 
     raise FileNotFoundError(
@@ -245,14 +262,14 @@ def get_short_path_name(long_name: str) -> str:
 
 
 def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict], list[str]]:
-    """Run exiftool sequentially by setting the active directory (cwd) to the file's parent folder.
-    This bypasses Windows spacing/Unicode/Cross-drive argument limits completely.
+    """Run exiftool sequentially for each file using its full absolute path.
+    Bypasses space issues via Python's built-in CreateProcessW argument quoting.
     Returns (results, errors).
     """
     tag_args = [f"-{t}" for t in EXIF_TAGS]
     
-    # ExifTool 자체 경로도 짧은 경로(8.3)로 보정하여 공백 에러 방지
-    exiftool_path = get_short_path_name(exiftool_path)
+    # ExifTool 자체 경로 절대 경로로 강제
+    exiftool_path = str(Path(exiftool_path).resolve().absolute())
     
     startupinfo = None
     if os.name == 'nt':
@@ -263,16 +280,11 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
     errors = []
     
     for path in image_paths:
-        p_obj = Path(path)
-        file_name = p_obj.name
-        parent_dir = str(p_obj.parent)
-        
-        # 작업 디렉토리를 이미지 폴더로 바꾸고 파일명만 전달
-        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [file_name]
+        abs_path = str(Path(path).resolve().absolute())
+        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [abs_path]
         try:
             result = subprocess.run(
                 cmd,
-                cwd=parent_dir,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -285,18 +297,17 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
                     data = json.loads(result.stdout)
                     if isinstance(data, list) and len(data) > 0:
                         rec = data[0]
-                        # 원래 수집된 절대 경로로 SourceFile 값 보정
-                        rec["SourceFile"] = str(p_obj.resolve().absolute())
+                        rec["SourceFile"] = abs_path
                         results.append(rec)
                     else:
-                        errors.append(f"[{file_name}] 빈 결과 또는 유효하지 않은 데이터")
+                        errors.append(f"[{Path(path).name}] 빈 결과 또는 유효하지 않은 데이터")
                 except json.JSONDecodeError as je:
-                    errors.append(f"[{file_name}] JSON 파싱 실패: {je}\n출력: {result.stdout[:200]}")
+                    errors.append(f"[{Path(path).name}] JSON 파싱 실패: {je}\n출력: {result.stdout[:200]}")
             else:
                 err_msg = result.stderr.strip() if result.stderr else f"ExitCode={result.returncode}"
-                errors.append(f"[{file_name}] ExifTool 오류: {err_msg}")
+                errors.append(f"[{Path(path).name}] ExifTool 오류: {err_msg}")
         except Exception as e:
-            errors.append(f"[{file_name}] 실행 중 예외: {str(e)}")
+            errors.append(f"[{Path(path).name}] 실행 중 예외: {str(e)}")
             continue
 
     return results, errors
