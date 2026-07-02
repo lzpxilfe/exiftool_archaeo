@@ -221,38 +221,40 @@ def find_exiftool(hint: str | None) -> str:
 
 
 def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
-    """Run exiftool and return parsed JSON list."""
+    """Run exiftool sequentially for each file to ensure maximum compatibility with Unicode/Korean paths and prevent argument limits."""
     tag_args = [f"-{t}" for t in EXIF_TAGS]
-    cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + image_paths
-
+    
     startupinfo = None
     if os.name == 'nt':
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-            startupinfo=startupinfo,
-        )
-    except subprocess.TimeoutExpired:
-        print("⚠️  ExifTool 실행 시간 초과", file=sys.stderr)
-        return []
+    results = []
+    
+    # 윈도우 환경 한글/공백 절대경로 전송 오류 우회를 위해 각 이미지별 순차 처리
+    for path in image_paths:
+        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [path]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                startupinfo=startupinfo,
+            )
+            if result.returncode in (0, 1) and result.stdout.strip():
+                data = json.loads(result.stdout)
+                if isinstance(data, list) and len(data) > 0:
+                    results.append(data[0])
+            else:
+                print(f"⚠️  ExifTool 파일 처리 실패 ({Path(path).name}): code={result.returncode}", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️  ExifTool 실행 오류 ({Path(path).name}): {e}", file=sys.stderr)
+            continue
 
-    if result.returncode not in (0, 1):
-        print(f"⚠️  ExifTool 오류: {result.stderr[:300]}", file=sys.stderr)
-        return []
-
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as e:
-        print(f"⚠️  JSON 파싱 오류: {e}", file=sys.stderr)
-        return []
+    return results
 
 
 def collect_images(input_path: str) -> list[str]:
