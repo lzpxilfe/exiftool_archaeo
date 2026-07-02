@@ -406,7 +406,10 @@ def run_gui():
 
                 # 3. EXIF 추출
                 log("▶ EXIF 데이터 추출 중… (잠시 기다려 주세요)", "info")
-                raw_records = run_exiftool(et, images)
+                raw_records, et_errors = run_exiftool(et, images)
+                if et_errors:
+                    for err in et_errors:
+                        log(f"  ⚠ {err}", "warn")
                 if not raw_records:
                     log("✘ EXIF 추출 실패", "err")
                     return

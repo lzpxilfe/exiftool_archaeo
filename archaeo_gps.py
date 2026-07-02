@@ -244,9 +244,10 @@ def get_short_path_name(long_name: str) -> str:
         return long_name
 
 
-def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
+def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict], list[str]]:
     """Run exiftool sequentially by setting the active directory (cwd) to the file's parent folder.
     This bypasses Windows spacing/Unicode/Cross-drive argument limits completely.
+    Returns (results, errors).
     """
     tag_args = [f"-{t}" for t in EXIF_TAGS]
     
@@ -259,6 +260,7 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
     results = []
+    errors = []
     
     for path in image_paths:
         p_obj = Path(path)
@@ -279,19 +281,25 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
                 startupinfo=startupinfo,
             )
             if result.returncode in (0, 1) and result.stdout.strip():
-                data = json.loads(result.stdout)
-                if isinstance(data, list) and len(data) > 0:
-                    rec = data[0]
-                    # 원래 수집된 절대 경로로 SourceFile 값 보정
-                    rec["SourceFile"] = str(p_obj.resolve().absolute())
-                    results.append(rec)
+                try:
+                    data = json.loads(result.stdout)
+                    if isinstance(data, list) and len(data) > 0:
+                        rec = data[0]
+                        # 원래 수집된 절대 경로로 SourceFile 값 보정
+                        rec["SourceFile"] = str(p_obj.resolve().absolute())
+                        results.append(rec)
+                    else:
+                        errors.append(f"[{file_name}] 빈 결과 또는 유효하지 않은 데이터")
+                except json.JSONDecodeError as je:
+                    errors.append(f"[{file_name}] JSON 파싱 실패: {je}\n출력: {result.stdout[:200]}")
             else:
-                print(f"⚠️  ExifTool 파일 처리 실패 ({file_name}): code={result.returncode}", file=sys.stderr)
+                err_msg = result.stderr.strip() if result.stderr else f"ExitCode={result.returncode}"
+                errors.append(f"[{file_name}] ExifTool 오류: {err_msg}")
         except Exception as e:
-            print(f"⚠️  ExifTool 실행 오류 ({file_name}): {e}", file=sys.stderr)
+            errors.append(f"[{file_name}] 실행 중 예외: {str(e)}")
             continue
 
-    return results
+    return results, errors
 
 
 def collect_images(input_path: str) -> list[str]:
@@ -1116,7 +1124,11 @@ def main():
 
     # ── EXIF 추출 ────────────────────────────────────────────────────────────
     print("📡 EXIF 데이터 추출 중…")
-    raw_records = run_exiftool(exiftool_path, images)
+    raw_records, et_errors = run_exiftool(exiftool_path, images)
+    if et_errors:
+        for err in et_errors:
+            print(f"  ⚠️ {err}", file=sys.stderr)
+            
     if not raw_records:
         print("❌ EXIF 데이터를 추출하지 못했습니다.", file=sys.stderr)
         sys.exit(1)
