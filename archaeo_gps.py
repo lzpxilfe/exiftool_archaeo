@@ -220,9 +220,36 @@ def find_exiftool(hint: str | None) -> str:
     )
 
 
+def get_short_path_name(long_name: str) -> str:
+    """Convert long Windows paths with spaces to 8.3 short paths to prevent subprocess argument splitting."""
+    if os.name != 'nt':
+        return long_name
+    import ctypes
+    from ctypes import wintypes
+    try:
+        buf_size = 512
+        buffer = ctypes.create_unicode_buffer(buf_size)
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        GetShortPathNameW.restype = wintypes.DWORD
+        
+        result = GetShortPathNameW(long_name, buffer, buf_size)
+        if result == 0:
+            return long_name
+        if result > buf_size:
+            buffer = ctypes.create_unicode_buffer(result)
+            GetShortPathNameW(long_name, buffer, result)
+        return buffer.value
+    except Exception:
+        return long_name
+
+
 def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
     """Run exiftool sequentially for each file to ensure maximum compatibility with Unicode/Korean paths and prevent argument limits."""
     tag_args = [f"-{t}" for t in EXIF_TAGS]
+    
+    # ExifTool 자체 경로 짧은 경로로 보정
+    exiftool_path = get_short_path_name(exiftool_path)
     
     startupinfo = None
     if os.name == 'nt':
@@ -233,7 +260,8 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
     
     # 윈도우 환경 한글/공백 절대경로 전송 오류 우회를 위해 각 이미지별 순차 처리
     for path in image_paths:
-        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [path]
+        short_path = get_short_path_name(path)
+        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [short_path]
         try:
             result = subprocess.run(
                 cmd,
