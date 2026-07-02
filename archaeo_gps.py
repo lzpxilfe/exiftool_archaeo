@@ -448,6 +448,7 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
 
 
 
+
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
@@ -456,9 +457,12 @@ def write_map(records: list[dict], output_path: str):
     """
     Generate a Leaflet.js HTML map.
     Features:
-      - Vworld (Korea Govt Map) + Esri Satellite with maxNativeZoom config for infinite zoom without errors
-      - Nadir (vertical 90-degree pitch) marker visual styling (circle target instead of directional arrow)
-      - Elegant wide popups showing thumbnail on the left and metadata on the right
+      - Esri Satellite & OSM Map (Removed Vworld due to connectivity issues)
+      - CartoDB Light Only Labels for satellite hybrid overlay
+      - maxNativeZoom configured to allow deep zoom without "Map data not yet available" errors
+      - Clickable popups with high-quality base64 thumbnails (640px)
+      - Lightbox overlay to view full-size photo upon clicking the popup thumbnail
+      - Nadir (vertical downward) circle-target marker representation for 90-degree pitch shots
     """
 
     features = []
@@ -483,28 +487,24 @@ def write_map(records: list[dict], output_path: str):
 
         yaw_display = f"{yaw}° ({card})" if yaw is not None else "N/A"
 
-        # Determine if it's a nadir (vertical downward) shot.
-        # DJI GimbalPitch is typically -90 when looking straight down.
+        # Determine if it's a nadir (vertical downward) shot (pitch <= -85)
         is_nadir = False
         if gimbal_pitch is not None:
             try:
-                # If pitch is near -90 degrees (e.g. -85 to -90)
                 if float(gimbal_pitch) <= -85.0:
                     is_nadir = True
             except (ValueError, TypeError):
                 pass
 
-        # Thumbnail (base64)
-        thumb_b64 = extract_thumbnail(source_file) if source_file else None
+        # Extract higher resolution thumbnail (640px) for lightbox detail view
+        thumb_b64 = extract_thumbnail(source_file, max_size=640) if source_file else None
 
-        # Build clean display values
         alt_val = f"{alt} m" if alt is not None else "N/A"
         gp_val = f"{gimbal_pitch}°" if gimbal_pitch is not None else "N/A"
         gr_val = f"{gimbal_roll}°" if gimbal_roll is not None else "N/A"
         gy_val = f"{gimbal_yaw}°" if gimbal_yaw is not None else "N/A"
         fy_val = f"{flight_yaw}°" if flight_yaw is not None else "N/A"
 
-        # Pass metadata variables to JavaScript features
         features.append({
             "lat": lat,
             "lon": lon,
@@ -557,6 +557,7 @@ def write_map(records: list[dict], output_path: str):
       width: 100%; 
       height: calc(100vh - 48px); 
       background: #101026;
+      z-index: 1;
     }}
     
     /* ── 세련된 가로형 와이드 팝업 스타일 커스텀 ── */
@@ -597,6 +598,11 @@ def write_map(records: list[dict], output_path: str):
       box-shadow: 0 4px 10px rgba(0,0,0,0.4);
       background: #090e1a;
       display: block;
+      cursor: zoom-in;
+      transition: transform 0.2s ease;
+    }}
+    .popup-thumb-box img:hover {{
+      transform: scale(1.03);
     }}
     .popup-meta-box {{
       flex: 1;
@@ -636,6 +642,38 @@ def write_map(records: list[dict], output_path: str):
       color: #fff;
     }}
     
+    /* ── 라이트박스(이미지 큰 확대 오버레이) 스타일 ── */
+    #lightbox {{
+      display: none;
+      position: fixed;
+      z-index: 9999;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(10, 10, 25, 0.92);
+      align-items: center;
+      justify-content: center;
+      cursor: zoom-out;
+      opacity: 0;
+      transition: opacity 0.2s ease-in-out;
+    }}
+    #lightbox.active {{
+      display: flex;
+      opacity: 1;
+    }}
+    #lightbox img {{
+      max-width: 90%;
+      max-height: 90%;
+      border-radius: 8px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+      border: 2px solid #e94560;
+      transform: scale(0.95);
+      transition: transform 0.2s ease-in-out;
+      cursor: default;
+    }}
+    #lightbox.active img {{
+      transform: scale(1);
+    }}
+    
     .legend {{
       background: rgba(22, 33, 62, 0.93);
       padding: 10px 14px;
@@ -658,17 +696,22 @@ def write_map(records: list[dict], output_path: str):
   
   <div id="map"></div>
 
+  <!-- 라이트박스 컨테이너 -->
+  <div id="lightbox" onclick="closeLightbox()">
+    <img id="lightbox-img" src="" onclick="event.stopPropagation()">
+  </div>
+
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // 맵 선언 (확대 범위 오류 해결: maxZoom을 크게 주고 타일 레이어에 maxNativeZoom 적용)
+    // 맵 선언 (확대 범위 오류 해결: maxZoom을 22로 주고 maxNativeZoom으로 에러 원천 차단)
     const map = L.map('map', {{
       maxZoom: 22,
       zoomControl: true
     }}).setView([{center_lat}, {center_lon}], 16);
 
-    // ── 베이스 레이어 (Vworld + Esri 위성) ─────────────────────────
-    // Esri Satellite: maxNativeZoom 18 설정으로 18레벨 타일을 22레벨까지 강제 확대(에러 방지)
-    const esriSatellite = L.tileLayer(
+    // ── 베이스 레이어 구성 ──────────────────────────────────────────────────
+    // Esri Satellite: maxNativeZoom 18 설정으로 18레벨 초과 시 픽셀 자동 강제 확대 지원
+    const satellite = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
       {{ 
         attribution: 'Tiles &copy; Esri', 
@@ -677,32 +720,11 @@ def write_map(records: list[dict], output_path: str):
       }}
     );
 
-    // Vworld Satellite (브이월드 위성 - 한국 지역 초고해상도)
-    const vworldSatellite = L.tileLayer(
-      'https://xdworld.vworld.kr/2d/Satellite/service/{{z}}/{{x}}/{{y}}.png',
+    // CartoDB Positron Only Labels: 투명 라벨 오버레이 레이어
+    const labels = L.tileLayer(
+      'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
       {{ 
-        attribution: 'Vworld', 
-        maxNativeZoom: 18, 
-        maxZoom: 22 
-      }}
-    );
-
-    // Vworld Hybrid (브이월드 행정구역/도로명 투명 오버레이 라벨)
-    const vworldHybrid = L.tileLayer(
-      'https://xdworld.vworld.kr/2d/Hybrid/service/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: 'Vworld', 
-        maxNativeZoom: 18, 
-        maxZoom: 22,
-        opacity: 0.95
-      }}
-    );
-
-    // Vworld Base (일반 전자지도)
-    const vworldBase = L.tileLayer(
-      'https://xdworld.vworld.kr/2d/Base/service/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: 'Vworld', 
+        attribution: '&copy; CartoDB', 
         maxNativeZoom: 18, 
         maxZoom: 22 
       }}
@@ -717,23 +739,37 @@ def write_map(records: list[dict], output_path: str):
       }}
     );
 
-    // 브이월드 하이브리드 자동 조합 레이어
-    const vworldCombo = L.layerGroup([vworldSatellite, vworldHybrid]);
+    // 하이브리드 조합 레이어 (위성 + CartoDB 라벨)
+    const hybrid = L.layerGroup([satellite, labels]);
 
-    // 기본 맵으로 브이월드 하이브리드 조합 맵 활성화
-    vworldCombo.addTo(map);
+    // 기본 레이어로 완벽한 위성 하이브리드 자동 적용
+    hybrid.addTo(map);
 
     L.control.layers(
       {{ 
-        "🛰 브이월드 하이브리드 (위성+라벨)": vworldCombo,
-        "🛰 브이월드 위성": vworldSatellite,
-        "🗺 브이월드 일반지도": vworldBase,
-        "🛰 Esri 위성 (전세계)": esriSatellite,
-        "🗺 OpenStreetMap": osm 
+        "🛰 위성 하이브리드 (위성+라벨)": hybrid,
+        "🛰 위성 단독 (라벨 제거)": satellite,
+        "🗺 일반 지도 (OpenStreetMap)": osm 
       }},
-      {{ "🏷 브이월드 도로/지명 라벨 (단독 토글)": vworldHybrid }},
+      {{ "🏷 지명/도로명 라벨 (단독 토글)": labels }},
       {{ position: 'topright', collapsed: false }}
     ).addTo(map);
+
+    // ── 라이트박스 제어 스크립트 ─────────────────────────────────────────────
+    function openLightbox(src) {{
+      const lb = document.getElementById('lightbox');
+      const img = document.getElementById('lightbox-img');
+      img.src = src;
+      lb.style.display = 'flex';
+      // 브라우저 렌더링 동기화를 위해 리플로우 발생 후 active 클래스 적용
+      setTimeout(() => lb.classList.add('active'), 10);
+    }}
+
+    function closeLightbox() {{
+      const lb = document.getElementById('lightbox');
+      lb.classList.remove('active');
+      setTimeout(() => lb.style.display = 'none', 200);
+    }}
 
     // ── 아이콘 팩토리 (수직촬영 Nadir vs 경사촬영 Yaw 화살표) ───────────────────
     function makeCustomIcon(f) {{
@@ -744,12 +780,9 @@ def write_map(records: list[dict], output_path: str):
         // 수직 촬영 (Pitch 90도 부근): 카메라 렌즈 과녁(Nadir Target) 디자인 적용
         svgHtml = `
           <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
-            <!-- 바깥 링 -->
             <circle cx="18" cy="18" r="12" fill="none" stroke="${{color}}" stroke-width="2.5" stroke-dasharray="2 2"/>
-            <!-- 안쪽 안테나 타겟 링 -->
             <circle cx="18" cy="18" r="7" fill="none" stroke="${{color}}" stroke-width="1.8"/>
             <circle cx="18" cy="18" r="3" fill="${{color}}"/>
-            <!-- 십자 십자선 (Nadir Crosshair) -->
             <line x1="18" y1="2" x2="18" y2="34" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
             <line x1="2" y1="18" x2="34" y2="18" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
           </svg>`;
@@ -782,7 +815,8 @@ def write_map(records: list[dict], output_path: str):
     function buildWidePopupHtml(f) {{
       let imgHtml = '';
       if (f.thumb_b64) {{
-        imgHtml = `<img src="data:image/jpeg;base64,${{f.thumb_b64}}">`;
+        // 썸네일 이미지를 클릭하면 라이트박스로 크게 띄움
+        imgHtml = `<img src="data:image/jpeg;base64,${{f.thumb_b64}}" onclick="openLightbox(this.src)" title="클릭하면 확대">`;
       }} else {{
         imgHtml = `<div style="width:100%; height:135px; background:#0f2044; border-radius:6px; display:flex; align-items:center; justify-content:center; color:#718096; border: 1px dashed #2d3748; font-size:0.75rem;">이미지 없음</div>`;
       }}
@@ -833,10 +867,10 @@ def write_map(records: list[dict], output_path: str):
       const d = L.DomUtil.create('div','legend');
       d.innerHTML = `
         <b>범례</b><br>
-        <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=바라보는 방향)<br>
+        <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=카메라 방향)<br>
         <span class="legend-dot" style="background:#718096"></span> 방향 정보 없음<br>
         <span style="display:inline-block; width:12px; height:12px; margin-right:6px; border:2px dashed #e94560; border-radius:50%; vertical-align:middle;"></span> 수직 촬영 (Pitch 90° 부근 과녁 마커)<br>
-        <span style="font-size:0.7rem;color:#a0aec0;">* 브이월드 지도는 휠을 굴려 초고배율 확대가 가능합니다.</span>`;
+        <span style="font-size:0.7rem;color:#a0aec0;">* 마커 팝업 내 썸네일을 클릭하면 원본 사진이 화면에 크게 확대됩니다.</span>`;
       return d;
     }};
     legend.addTo(map);
