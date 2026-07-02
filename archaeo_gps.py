@@ -185,39 +185,38 @@ def find_exiftool(hint: str | None) -> str:
       3. Same folder as this script
       4. System PATH
     """
-    candidates = []
+    import shutil
+    
     if hint:
-        candidates.append(hint)
+        if Path(hint).is_file():
+            return str(Path(hint).resolve().absolute())
+        w = shutil.which(hint)
+        if w:
+            return str(Path(w).resolve().absolute())
 
     # PyInstaller frozen exe: look next to the .exe first
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
-        candidates += [
-            str(exe_dir / "exiftool.exe"),
-            str(exe_dir / "exiftool"),
-        ]
+        for name in ["exiftool.exe", "exiftool"]:
+            target = exe_dir / name
+            if target.is_file():
+                return str(target.resolve().absolute())
 
     # Script directory
     script_dir = Path(__file__).parent
-    candidates += [
-        str(script_dir / "exiftool.exe"),
-        str(script_dir / "exiftool"),
-        "exiftool",
-        "exiftool.exe",
-    ]
-    for c in candidates:
-        try:
-            result = subprocess.run(
-                [c, "-ver"],
-                capture_output=True, text=True, timeout=5
-            )
-            if result.returncode == 0:
-                return c
-        except (FileNotFoundError, OSError):
-            continue
+    for name in ["exiftool.exe", "exiftool"]:
+        target = script_dir / name
+        if target.is_file():
+            return str(target.resolve().absolute())
+
+    # System PATH
+    for name in ["exiftool.exe", "exiftool"]:
+        w = shutil.which(name)
+        if w:
+            return str(Path(w).resolve().absolute())
+
     raise FileNotFoundError(
-        "exiftool을 찾을 수 없습니다. --exiftool 옵션으로 경로를 지정하거나 PATH에 추가하세요.\n"
-        "  다운로드: https://exiftool.org"
+        "exiftool을 찾을 수 없습니다. ExifToolArchaeo.exe 실행 파일과 동일한 폴더에 exiftool.exe 파일을 복사해서 넣어주십시오."
     )
 
 
@@ -225,6 +224,11 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
     """Run exiftool and return parsed JSON list."""
     tag_args = [f"-{t}" for t in EXIF_TAGS]
     cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + image_paths
+
+    startupinfo = None
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
     try:
         result = subprocess.run(
@@ -234,6 +238,7 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
             encoding="utf-8",
             errors="replace",
             timeout=120,
+            startupinfo=startupinfo,
         )
     except subprocess.TimeoutExpired:
         print("⚠️  ExifTool 실행 시간 초과", file=sys.stderr)
