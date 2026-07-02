@@ -1,0 +1,8 @@
+# ExifTool Archaeo — 의존성
+# pip install -r requirements.txt
+
+# 필수
+pyproj>=3.6.0        # 좌표계 변환 (WGS84 → TM중부원점 등)
+
+# 권장
+pandas>=2.0.0        # CSV 처리 (없으면 표준 csv 모듈로 대체)
