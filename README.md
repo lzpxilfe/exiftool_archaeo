@@ -8,6 +8,23 @@
 
 ---
 
+## ⬇️ 실행 파일 다운로드 (Windows)
+
+> Python 설치 없이 바로 사용 가능합니다.
+
+`dist/` 폴더의 두 파일을 같은 폴더에 놓고 **`ExifToolArchaeo.exe`를 더블클릭**하세요:
+
+| 파일 | 설명 |
+|------|------|
+| `ExifToolArchaeo.exe` | 메인 실행 파일 (GUI + CLI 통합) |
+| `exiftool.exe` | ExifTool 본체 (함께 있어야 함) |
+
+**사용 방법:**
+- **더블클릭** → GUI 창이 열립니다
+- **드래그 앤 드롭** or **CLI** → `ExifToolArchaeo.exe -i ./photos -o out.csv --crs tm`
+
+---
+
 ## 배경
 
 고고학 발굴 현장, 특히 우거진 산림 지형에서 드론 사진만으로는  

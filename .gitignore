@@ -5,6 +5,11 @@ __pycache__/
 .venv/
 venv/
 
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.spec.bak
+
 # 출력 파일 (개인 데이터 제외)
 output/
 
@@ -26,3 +31,4 @@ Thumbs.db
 
 # 기존 CSV (개인 데이터)
 gps_data.csv
+
