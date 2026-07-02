@@ -447,12 +447,19 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
 
 
 
+
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
 
 def write_map(records: list[dict], output_path: str):
-    """Generate a Leaflet.js HTML map with direction arrows and a detailed side panel."""
+    """
+    Generate a Leaflet.js HTML map.
+    Features:
+      - Vworld (Korea Govt Map) + Esri Satellite with maxNativeZoom config for infinite zoom without errors
+      - Nadir (vertical 90-degree pitch) marker visual styling (circle target instead of directional arrow)
+      - Elegant wide popups showing thumbnail on the left and metadata on the right
+    """
 
     features = []
     for rec in records:
@@ -469,38 +476,50 @@ def write_map(records: list[dict], output_path: str):
         alt          = rec.get("Alt_m", "")
         make         = rec.get("Make", "")
         model        = rec.get("Model", "")
-        gimbal_pitch = rec.get("GimbalPitch", "")
-        gimbal_roll  = rec.get("GimbalRoll", "")
-        flight_yaw   = rec.get("FlightYaw", "")
-        gimbal_yaw   = rec.get("GimbalYaw", "")
+        gimbal_pitch = rec.get("GimbalPitch")
+        gimbal_roll  = rec.get("GimbalRoll")
+        flight_yaw   = rec.get("FlightYaw")
+        gimbal_yaw   = rec.get("GimbalYaw")
 
         yaw_display = f"{yaw}° ({card})" if yaw is not None else "N/A"
+
+        # Determine if it's a nadir (vertical downward) shot.
+        # DJI GimbalPitch is typically -90 when looking straight down.
+        is_nadir = False
+        if gimbal_pitch is not None:
+            try:
+                # If pitch is near -90 degrees (e.g. -85 to -90)
+                if float(gimbal_pitch) <= -85.0:
+                    is_nadir = True
+            except (ValueError, TypeError):
+                pass
 
         # Thumbnail (base64)
         thumb_b64 = extract_thumbnail(source_file) if source_file else None
 
-        # Mini popup content (just filename and coordinates)
-        popup_html = f"""
-<div style="font-family:'Segoe UI',sans-serif;font-size:0.8rem;line-height:1.4;">
-  <b>{fname}</b><br>
-  방향: {yaw_display}
-</div>"""
+        # Build clean display values
+        alt_val = f"{alt} m" if alt is not None else "N/A"
+        gp_val = f"{gimbal_pitch}°" if gimbal_pitch is not None else "N/A"
+        gr_val = f"{gimbal_roll}°" if gimbal_roll is not None else "N/A"
+        gy_val = f"{gimbal_yaw}°" if gimbal_yaw is not None else "N/A"
+        fy_val = f"{flight_yaw}°" if flight_yaw is not None else "N/A"
 
+        # Pass metadata variables to JavaScript features
         features.append({
             "lat": lat,
             "lon": lon,
             "yaw": yaw if yaw is not None else 0,
             "has_dir": yaw is not None,
-            "popup": popup_html,
+            "is_nadir": is_nadir,
             "fname": fname,
             "dt": dt or "N/A",
-            "alt": alt if alt is not None else "N/A",
+            "alt": alt_val,
             "make": make or "N/A",
             "model": model or "N/A",
-            "gimbal_yaw": gimbal_yaw if gimbal_yaw is not None else "N/A",
-            "gimbal_pitch": gimbal_pitch if gimbal_pitch is not None else "N/A",
-            "gimbal_roll": gimbal_roll if gimbal_roll is not None else "N/A",
-            "flight_yaw": flight_yaw if flight_yaw is not None else "N/A",
+            "gimbal_yaw": gy_val,
+            "gimbal_pitch": gp_val,
+            "gimbal_roll": gr_val,
+            "flight_yaw": fy_val,
             "yaw_display": yaw_display,
             "thumb_b64": thumb_b64 if thumb_b64 else "",
         })
@@ -522,62 +541,99 @@ def write_map(records: list[dict], output_path: str):
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
+    body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; overflow: hidden; }}
     
     #header {{
       padding: 10px 20px;
       background: linear-gradient(135deg, #16213e, #0f3460);
       border-bottom: 2px solid #e94560;
       display: flex; align-items: center; gap: 12px;
-      z-index: 1000;
-      flex-shrink: 0;
+      height: 48px;
     }}
     #header h1 {{ font-size: 1.05rem; font-weight: 700; letter-spacing: 0.3px; color: #fff; }}
     #header .sub {{ font-size: 0.8rem; color: #a0aec0; }}
     
-    #app-container {{
+    #map {{ 
+      width: 100%; 
+      height: calc(100vh - 48px); 
+      background: #101026;
+    }}
+    
+    /* ── 세련된 가로형 와이드 팝업 스타일 커스텀 ── */
+    .leaflet-popup-content-wrapper {{
+      background: #16213e !important;
+      color: #eee !important;
+      border-radius: 12px !important;
+      box-shadow: 0 6px 24px rgba(0,0,0,0.5) !important;
+      border: 1px solid #e94560;
+      padding: 0 !important;
+    }}
+    .leaflet-popup-content {{
+      margin: 0 !important;
+      padding: 12px !important;
+      line-height: 1.4;
+    }}
+    .leaflet-popup-tip {{
+      background: #16213e !important;
+      border: 1px solid #e94560;
+    }}
+    
+    /* 와이드 팝업 컨테이너 */
+    .popup-container {{
       display: flex;
-      flex: 1;
-      width: 100%;
-      height: calc(100vh - 48px);
-      position: relative;
+      gap: 16px;
+      min-width: 460px;
+      max-width: 520px;
+      align-items: flex-start;
     }}
-    
-    #map {{
-      flex: 1;
-      height: 100%;
-      z-index: 1;
-    }}
-    
-    #sidebar {{
-      width: 380px;
-      background: #16213e;
-      border-left: 2px solid #e94560;
-      height: 100%;
-      overflow-y: auto;
-      padding: 20px;
-      color: #eee;
-      z-index: 5;
+    .popup-thumb-box {{
+      width: 180px;
       flex-shrink: 0;
-      box-shadow: -4px 0 15px rgba(0,0,0,0.5);
     }}
-    
-    .sidebar-table {{
+    .popup-thumb-box img {{
       width: 100%;
-      font-size: 0.85rem;
-      border-collapse: collapse;
-      margin-top: 15px;
+      height: auto;
+      border-radius: 8px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+      background: #090e1a;
+      display: block;
     }}
-    .sidebar-table tr {{
-      border-bottom: 1px solid #2d3748;
+    .popup-meta-box {{
+      flex: 1;
     }}
-    .sidebar-table td {{
-      padding: 8px 6px;
-      vertical-align: middle;
+    .popup-meta-box h3 {{
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: #e94560;
+      margin-bottom: 2px;
+      word-break: break-all;
     }}
-    .sidebar-table td.label-col {{
+    .popup-meta-box .time-str {{
+      font-size: 0.75rem;
       color: #94a3b8;
-      width: 110px;
+      margin-bottom: 8px;
+    }}
+    .popup-table {{
+      width: 100%;
+      font-size: 0.78rem;
+      border-collapse: collapse;
+    }}
+    .popup-table tr {{
+      border-bottom: 1px solid #24355a;
+    }}
+    .popup-table tr:last-child {{
+      border-bottom: none;
+    }}
+    .popup-table td {{
+      padding: 5px 2px;
+    }}
+    .popup-table td.lbl {{
+      color: #a0aec0;
+      width: 80px;
+    }}
+    .popup-table td.val {{
+      font-weight: bold;
+      color: #fff;
     }}
     
     .legend {{
@@ -600,125 +656,171 @@ def write_map(records: list[dict], output_path: str):
     <span style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
   </div>
   
-  <div id="app-container">
-    <div id="map"></div>
-    <div id="sidebar">
-      <div id="sidebar-placeholder" style="text-align: center; margin-top: 60px; color: #a0aec0; line-height: 1.8;">
-        <span style="font-size: 3.5rem; display: block; margin-bottom: 15px;">📸</span>
-        <b style="color: #fff; font-size: 0.95rem;">사진 상세 정보 패널</b><br>
-        지도 위 화살표 마커를 클릭하시면<br>촬영 방향 정보와 사진 썸네일이<br>이곳에 상세히 연동되어 표시됩니다.
-      </div>
-      <div id="sidebar-content" style="display: none;">
-        <!-- JS가 동적으로 마커 데이터를 매핑하여 렌더링 -->
-      </div>
-    </div>
-  </div>
+  <div id="map"></div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    const map = L.map('map').setView([{center_lat}, {center_lon}], 15);
+    // 맵 선언 (확대 범위 오류 해결: maxZoom을 크게 주고 타일 레이어에 maxNativeZoom 적용)
+    const map = L.map('map', {{
+      maxZoom: 22,
+      zoomControl: true
+    }}).setView([{center_lat}, {center_lon}], 16);
 
-    // ── 베이스 레이어 (Esri 위성 + CartoDB 하이브리드) ─────────────────────────
-    const satellite = L.tileLayer(
+    // ── 베이스 레이어 (Vworld + Esri 위성) ─────────────────────────
+    // Esri Satellite: maxNativeZoom 18 설정으로 18레벨 타일을 22레벨까지 강제 확대(에러 방지)
+    const esriSatellite = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
-      {{ attribution: 'Tiles &copy; Esri', maxZoom: 20 }}
+      {{ 
+        attribution: 'Tiles &copy; Esri', 
+        maxNativeZoom: 18, 
+        maxZoom: 22 
+      }}
     );
+
+    // Vworld Satellite (브이월드 위성 - 한국 지역 초고해상도)
+    const vworldSatellite = L.tileLayer(
+      'https://xdworld.vworld.kr/2d/Satellite/service/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: 'Vworld', 
+        maxNativeZoom: 18, 
+        maxZoom: 22 
+      }}
+    );
+
+    // Vworld Hybrid (브이월드 행정구역/도로명 투명 오버레이 라벨)
+    const vworldHybrid = L.tileLayer(
+      'https://xdworld.vworld.kr/2d/Hybrid/service/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: 'Vworld', 
+        maxNativeZoom: 18, 
+        maxZoom: 22,
+        opacity: 0.95
+      }}
+    );
+
+    // Vworld Base (일반 전자지도)
+    const vworldBase = L.tileLayer(
+      'https://xdworld.vworld.kr/2d/Base/service/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: 'Vworld', 
+        maxNativeZoom: 18, 
+        maxZoom: 22 
+      }}
+    );
+
     const osm = L.tileLayer(
       'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
-      {{ attribution: '&copy; OpenStreetMap contributors', maxZoom: 20 }}
-    );
-    
-    // CartoDB Positron Only Labels: 완벽한 투명 텍스트/도로 오버레이 레이어
-    const cartoLabels = L.tileLayer(
-      'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
-      {{ attribution: '&copy; CartoDB', maxZoom: 20, pane: 'shadowPane' }} // 라벨이 항상 마커 뒤, 지도 위에 보이도록 설정
+      {{ 
+        attribution: '&copy; OSM', 
+        maxNativeZoom: 19, 
+        maxZoom: 22 
+      }}
     );
 
-    // 하이브리드: 위성 타일 위에 CartoDB의 투명 라벨 레이어를 겹쳐서 출력
-    const hybrid = L.layerGroup([
-      L.tileLayer(
-        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
-        {{ attribution: 'Tiles &copy; Esri', maxZoom: 20 }}
-      ),
-      L.tileLayer(
-        'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
-        {{ attribution: '&copy; CartoDB', maxZoom: 20 }}
-      )
-    ]);
+    // 브이월드 하이브리드 자동 조합 레이어
+    const vworldCombo = L.layerGroup([vworldSatellite, vworldHybrid]);
 
-    // 기본 맵으로 위성 레이어 설정
-    satellite.addTo(map);
+    // 기본 맵으로 브이월드 하이브리드 조합 맵 활성화
+    vworldCombo.addTo(map);
 
     L.control.layers(
       {{ 
-        "🛰 위성": satellite, 
-        "🛰+🏷 하이브리드 (위성+라벨)": hybrid,
-        "🗺 일반 지도 (OSM)": osm 
+        "🛰 브이월드 하이브리드 (위성+라벨)": vworldCombo,
+        "🛰 브이월드 위성": vworldSatellite,
+        "🗺 브이월드 일반지도": vworldBase,
+        "🛰 Esri 위성 (전세계)": esriSatellite,
+        "🗺 OpenStreetMap": osm 
       }},
-      {{ "🏷 도로/지명 라벨 (위성 단독 적용용)": cartoLabels }},
+      {{ "🏷 브이월드 도로/지명 라벨 (단독 토글)": vworldHybrid }},
       {{ position: 'topright', collapsed: false }}
     ).addTo(map);
 
-    // ── 화살표 아이콘 ────────────────────────────────────────────────────────
-    function makeArrowIcon(yawDeg, hasDir) {{
-      const color = hasDir ? '#e94560' : '#718096';
-      const arrowSvg = hasDir ? `
-        <line x1="18" y1="18" x2="18" y2="4"
-          stroke="${{color}}" stroke-width="2.5" stroke-linecap="round"
-          transform="rotate(${{yawDeg}},18,18)"/>
-        <polygon points="18,1 14.5,9 21.5,9"
-          fill="${{color}}" transform="rotate(${{yawDeg}},18,18)"/>` : '';
-      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
-        <circle cx="18" cy="18" r="11" fill="${{color}}" fill-opacity="0.18" stroke="${{color}}" stroke-width="2"/>
-        <circle cx="18" cy="18" r="3.5" fill="${{color}}"/>
-        ${{arrowSvg}}
-      </svg>`;
+    // ── 아이콘 팩토리 (수직촬영 Nadir vs 경사촬영 Yaw 화살표) ───────────────────
+    function makeCustomIcon(f) {{
+      const color = f.has_dir ? '#e94560' : '#718096';
+      let svgHtml = '';
+
+      if (f.is_nadir) {{
+        // 수직 촬영 (Pitch 90도 부근): 카메라 렌즈 과녁(Nadir Target) 디자인 적용
+        svgHtml = `
+          <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+            <!-- 바깥 링 -->
+            <circle cx="18" cy="18" r="12" fill="none" stroke="${{color}}" stroke-width="2.5" stroke-dasharray="2 2"/>
+            <!-- 안쪽 안테나 타겟 링 -->
+            <circle cx="18" cy="18" r="7" fill="none" stroke="${{color}}" stroke-width="1.8"/>
+            <circle cx="18" cy="18" r="3" fill="${{color}}"/>
+            <!-- 십자 십자선 (Nadir Crosshair) -->
+            <line x1="18" y1="2" x2="18" y2="34" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
+            <line x1="2" y1="18" x2="34" y2="18" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
+          </svg>`;
+      }} else {{
+        // 경사 촬영 (방향 화살표 지시)
+        const arrowSvg = f.has_dir ? `
+          <line x1="18" y1="18" x2="18" y2="4"
+            stroke="${{color}}" stroke-width="2.5" stroke-linecap="round"
+            transform="rotate(${{f.yaw}},18,18)"/>
+          <polygon points="18,1 14.5,9 21.5,9"
+            fill="${{color}}" transform="rotate(${{f.yaw}},18,18)"/>` : '';
+        svgHtml = `
+          <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+            <circle cx="18" cy="18" r="11" fill="${{color}}" fill-opacity="0.18" stroke="${{color}}" stroke-width="2"/>
+            <circle cx="18" cy="18" r="3.5" fill="${{color}}"/>
+            ${{arrowSvg}}
+          </svg>`;
+      }}
+
       return L.divIcon({{
-        html: svg, className: '',
-        iconSize: [36,36], iconAnchor: [18,18], popupAnchor: [0,-22],
+        html: svgHtml, 
+        className: '',
+        iconSize: [36,36], 
+        iconAnchor: [18,18], 
+        popupAnchor: [0,-22],
       }});
     }}
 
-    // ── 마커 및 사이드바 바인딩 ───────────────────────────────────────────────
+    // ── 와이드형 팝업 HTML 생성 ───────────────────────────────────────────────
+    function buildWidePopupHtml(f) {{
+      let imgHtml = '';
+      if (f.thumb_b64) {{
+        imgHtml = `<img src="data:image/jpeg;base64,${{f.thumb_b64}}">`;
+      }} else {{
+        imgHtml = `<div style="width:100%; height:135px; background:#0f2044; border-radius:6px; display:flex; align-items:center; justify-content:center; color:#718096; border: 1px dashed #2d3748; font-size:0.75rem;">이미지 없음</div>`;
+      }}
+
+      const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
+
+      return `
+        <div class="popup-container">
+          <div class="popup-thumb-box">
+            ${{imgHtml}}
+          </div>
+          <div class="popup-meta-box">
+            <h3>${{f.fname}}${{angleLabel}}</h3>
+            <div class="time-str">🕐 촬영: ${{f.dt}}</div>
+            <table class="popup-table">
+              <tr><td class="lbl">📍 위도/경도</td><td class="val" style="font-family:monospace;">${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}</td></tr>
+              <tr><td class="lbl">⬆ GPS 고도</td><td class="val">${{f.alt}}</td></tr>
+              <tr><td class="lbl">🧭 카메라 방향</td><td class="val" style="color:#e94560;">${{f.yaw_display}}</td></tr>
+              <tr><td class="lbl" style="padding-left:10px;">짐벌 Y/P/R</td><td class="val" style="font-family:monospace; font-size:0.72rem;">${{f.gimbal_yaw}} / ${{f.gimbal_pitch}} / ${{f.gimbal_roll}}</td></tr>
+              <tr><td class="lbl" style="padding-left:10px;">기체 Yaw</td><td class="val" style="font-family:monospace; font-size:0.72rem;">${{f.flight_yaw}}</td></tr>
+              <tr><td class="lbl">📷 장비 정보</td><td class="val" style="font-size:0.72rem;">${{f.make}} ${{f.model}}</td></tr>
+            </table>
+          </div>
+        </div>
+      `;
+    }}
+
+    // ── 마커 그룹 배치 ─────────────────────────────────────────────────────────
     const features = {features_json};
     const markerGroup = L.featureGroup();
 
     features.forEach(f => {{
-      const marker = L.marker([f.lat, f.lon], {{ icon: makeArrowIcon(f.yaw, f.has_dir) }})
-        .bindPopup(f.popup, {{ maxWidth: 200, className: '' }});
-      
-      // 클릭 시 오른쪽 사이드바에 사진 정보 로드
-      marker.on('click', function() {{
-        document.getElementById('sidebar-placeholder').style.display = 'none';
-        const contentDiv = document.getElementById('sidebar-content');
-        contentDiv.style.display = 'block';
-        
-        let imgHtml = '';
-        if (f.thumb_b64) {{
-          imgHtml = `<img src="data:image/jpeg;base64,${{f.thumb_b64}}" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); margin-bottom:15px; max-height:220px; object-fit:contain; background:#000;">`;
-        }} else {{
-          imgHtml = `<div style="width:100%; height:160px; background:#0f2044; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#718096; margin-bottom:15px; border: 1px dashed #2d3748;">썸네일 이미지 없음</div>`;
-        }}
-
-        contentDiv.innerHTML = `
-          ${{imgHtml}}
-          <h2 style="font-size:1.1rem; font-weight:700; margin-bottom:4px; color:#e94560; word-break:break-all; line-height:1.3;">${{f.fname}}</h2>
-          <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:15px;">🕐 촬영시각: ${{f.dt}}</div>
-          <hr style="border:none; border-top:1px solid #2d3748; margin-bottom:15px;">
-          
-          <table class="sidebar-table">
-            <tr><td class="label-col">📍 위도/경도</td><td style="font-family:monospace; font-weight:bold; color:#fff;">${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}</td></tr>
-            <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}} m</td></tr>
-            <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}°</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}°</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">짐벌 Roll</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_roll}}°</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}°</td></tr>
-            <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
-          </table>
-        `;
-      }});
-
+      const marker = L.marker([f.lat, f.lon], {{ icon: makeCustomIcon(f) }})
+        .bindPopup(buildWidePopupHtml(f), {{ 
+          maxWidth: 550, 
+          minWidth: 460, 
+          className: '' 
+        }});
       markerGroup.addLayer(marker);
     }});
 
@@ -731,9 +833,10 @@ def write_map(records: list[dict], output_path: str):
       const d = L.DomUtil.create('div','legend');
       d.innerHTML = `
         <b>범례</b><br>
-        <span class="legend-dot" style="background:#e94560"></span> 방향 정보 있음<br>
+        <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=바라보는 방향)<br>
         <span class="legend-dot" style="background:#718096"></span> 방향 정보 없음<br>
-        <span style="font-size:0.7rem;color:#a0aec0;">화살표 = 카메라(짐벌) 방향</span>`;
+        <span style="display:inline-block; width:12px; height:12px; margin-right:6px; border:2px dashed #e94560; border-radius:50%; vertical-align:middle;"></span> 수직 촬영 (Pitch 90° 부근 과녁 마커)<br>
+        <span style="font-size:0.7rem;color:#a0aec0;">* 브이월드 지도는 휠을 굴려 초고배율 확대가 가능합니다.</span>`;
       return d;
     }};
     legend.addTo(map);
