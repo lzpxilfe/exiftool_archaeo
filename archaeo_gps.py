@@ -21,11 +21,16 @@ from pathlib import Path
 # Windows 콘솔 UTF-8 강제 (이모지·한글 출력)
 # console=False exe 에서는 stdout/stderr 가 None 이므로 반드시 None 체크 필요
 if sys.platform == "win32":
-    import io
-    if sys.stdout is not None and hasattr(sys.stdout, "buffer"):
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    if sys.stderr is not None and hasattr(sys.stderr, "buffer"):
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Optional dependencies (graceful degradation)
@@ -173,11 +178,26 @@ def normalize_yaw(yaw: float | None) -> float | None:
 
 
 def find_exiftool(hint: str | None) -> str:
-    """Locate exiftool executable."""
+    """Locate exiftool executable.
+    Search order:
+      1. hint (--exiftool argument)
+      2. Same folder as the running exe (PyInstaller frozen build)
+      3. Same folder as this script
+      4. System PATH
+    """
     candidates = []
     if hint:
         candidates.append(hint)
-    # Common locations
+
+    # PyInstaller frozen exe: look next to the .exe first
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        candidates += [
+            str(exe_dir / "exiftool.exe"),
+            str(exe_dir / "exiftool"),
+        ]
+
+    # Script directory
     script_dir = Path(__file__).parent
     candidates += [
         str(script_dir / "exiftool.exe"),
@@ -347,6 +367,42 @@ def _to_float(val) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Thumbnail extraction (Pillow)
+# ---------------------------------------------------------------------------
+
+try:
+    from PIL import Image as _PILImage
+    import io as _io
+    import base64 as _base64
+    HAS_PILLOW = True
+except ImportError:
+    HAS_PILLOW = False
+
+
+def extract_thumbnail(source_file: str, max_size: int = 320) -> str | None:
+    """
+    Open the original photo, resize to thumbnail, return base64 JPEG string.
+    Returns None if Pillow is unavailable or file cannot be opened.
+    """
+    if not HAS_PILLOW:
+        return None
+    try:
+        with _PILImage.open(source_file) as img:
+            # Preserve EXIF orientation
+            try:
+                from PIL import ImageOps
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                pass
+            img.thumbnail((max_size, max_size), _PILImage.LANCZOS)
+            buf = _io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=72)
+            return _base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # CSV output
 # ---------------------------------------------------------------------------
 
@@ -389,12 +445,13 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
     print(f"✅ CSV 저장: {output_path}  ({len(rows)}개 레코드)")
 
 
+
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
 
 def write_map(records: list[dict], output_path: str):
-    """Generate a Leaflet.js HTML map with direction arrows."""
+    """Generate a Leaflet.js HTML map with direction arrows and photo thumbnails."""
 
     features = []
     for rec in records:
@@ -403,37 +460,62 @@ def write_map(records: list[dict], output_path: str):
         if lat is None or lon is None:
             continue
 
-        yaw = rec.get("CamDirection_deg")
-        card = rec.get("CamDirection_cardinal", "")
-        fname = rec.get("FileName", "")
-        dt = rec.get("DateTime", "")
-        alt = rec.get("Alt_m", "")
-        make = rec.get("Make", "")
-        model = rec.get("Model", "")
+        yaw          = rec.get("CamDirection_deg")
+        card         = rec.get("CamDirection_cardinal", "")
+        fname        = rec.get("FileName", "")
+        source_file  = rec.get("SourceFile", "")
+        dt           = rec.get("DateTime", "")
+        alt          = rec.get("Alt_m", "")
+        make         = rec.get("Make", "")
+        model        = rec.get("Model", "")
         gimbal_pitch = rec.get("GimbalPitch", "")
-        flight_yaw = rec.get("FlightYaw", "")
-        gimbal_yaw = rec.get("GimbalYaw", "")
+        gimbal_roll  = rec.get("GimbalRoll", "")
+        flight_yaw   = rec.get("FlightYaw", "")
+        gimbal_yaw   = rec.get("GimbalYaw", "")
 
         yaw_display = f"{yaw}° ({card})" if yaw is not None else "N/A"
 
-        popup = (
-            f"<b>{fname}</b><br>"
-            f"📍 {lat:.6f}, {lon:.6f}<br>"
-            f"⬆ 고도: {alt} m<br>"
-            f"🧭 촬영방향: {yaw_display}<br>"
-            f"&nbsp;&nbsp;&nbsp;│ 짐벌 Yaw: {gimbal_yaw}°<br>"
-            f"&nbsp;&nbsp;&nbsp;│ 짐벌 Pitch: {gimbal_pitch}°<br>"
-            f"&nbsp;&nbsp;&nbsp;└ 기체 Yaw: {flight_yaw}°<br>"
-            f"📷 {make} {model}<br>"
-            f"🕐 {dt}"
+        # Thumbnail (base64)
+        thumb_b64 = extract_thumbnail(source_file) if source_file else None
+        thumb_html = (
+            f'<img src="data:image/jpeg;base64,{thumb_b64}" '
+            f'style="width:100%;border-radius:6px;margin-bottom:10px;'
+            f'box-shadow:0 2px 8px rgba(0,0,0,0.35);">'
+            if thumb_b64 else ""
         )
+
+        popup_html = f"""
+<div style="font-family:'Segoe UI',sans-serif;min-width:260px;max-width:300px;">
+  {thumb_html}
+  <div style="font-size:0.9rem;font-weight:700;margin-bottom:2px;">{fname}</div>
+  <div style="font-size:0.75rem;color:#888;margin-bottom:8px;">{dt}</div>
+  <hr style="border:none;border-top:1px solid #e2e8f0;margin:6px 0;">
+  <table style="font-size:0.8rem;border-collapse:collapse;width:100%;">
+    <tr><td style="color:#888;padding:2px 6px 2px 0;">📍 위치</td>
+        <td style="font-family:monospace;">{lat:.6f}, {lon:.6f}</td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;">⬆ 고도</td>
+        <td>{alt} m</td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;">🧭 방향</td>
+        <td><b>{yaw_display}</b></td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">짐벌 Yaw</td>
+        <td style="font-family:monospace;">{gimbal_yaw}°</td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">짐벌 Pitch</td>
+        <td style="font-family:monospace;">{gimbal_pitch}°</td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">짐벌 Roll</td>
+        <td style="font-family:monospace;">{gimbal_roll}°</td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">기체 Yaw</td>
+        <td style="font-family:monospace;">{flight_yaw}°</td></tr>
+    <tr><td style="color:#888;padding:2px 6px 2px 0;">📷 카메라</td>
+        <td>{make} {model}</td></tr>
+  </table>
+</div>"""
 
         features.append({
             "lat": lat,
             "lon": lon,
             "yaw": yaw if yaw is not None else 0,
             "has_dir": yaw is not None,
-            "popup": popup,
+            "popup": popup_html,
             "fname": fname,
         })
 
@@ -441,10 +523,8 @@ def write_map(records: list[dict], output_path: str):
         print("⚠️  지도에 표시할 GPS 데이터가 없습니다.", file=sys.stderr)
         return
 
-    # Center map on mean position
     center_lat = sum(f["lat"] for f in features) / len(features)
     center_lon = sum(f["lon"] for f in features) / len(features)
-
     features_json = json.dumps(features, ensure_ascii=False, indent=2)
 
     html = f"""<!DOCTYPE html>
@@ -458,33 +538,42 @@ def write_map(records: list[dict], output_path: str):
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; }}
     #header {{
-      padding: 12px 20px;
+      padding: 10px 20px;
       background: linear-gradient(135deg, #16213e, #0f3460);
       border-bottom: 2px solid #e94560;
       display: flex; align-items: center; gap: 12px;
     }}
-    #header h1 {{ font-size: 1.1rem; font-weight: 600; letter-spacing: 0.5px; }}
-    #header span {{ font-size: 0.85rem; color: #a0aec0; }}
-    #map {{ width: 100%; height: calc(100vh - 52px); }}
-    .leaflet-popup-content {{ font-size: 0.82rem; line-height: 1.7; min-width: 200px; }}
+    #header h1 {{ font-size: 1.05rem; font-weight: 700; letter-spacing: 0.3px; }}
+    #header .sub {{ font-size: 0.8rem; color: #a0aec0; }}
+    #map {{ width: 100%; height: calc(100vh - 48px); }}
+    .leaflet-popup-content-wrapper {{
+      border-radius: 10px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      padding: 0;
+    }}
+    .leaflet-popup-content {{
+      margin: 14px 14px 10px 14px;
+      line-height: 1.5;
+    }}
+    .leaflet-popup-tip-container {{ margin-top: -1px; }}
     .legend {{
-      background: rgba(22,33,62,0.92);
+      background: rgba(22,33,62,0.93);
       padding: 10px 14px;
       border-radius: 8px;
       border: 1px solid #e94560;
-      font-size: 0.78rem;
+      font-size: 0.76rem;
       color: #eee;
-      line-height: 1.8;
+      line-height: 1.9;
     }}
-    .legend-dot {{ display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }}
+    .legend-dot {{ display:inline-block; width:11px; height:11px; border-radius:50%; margin-right:6px; vertical-align:middle; }}
   </style>
 </head>
 <body>
   <div id="header">
-    <span style="font-size:1.4rem;">🏛️</span>
+    <span style="font-size:1.3rem;">🏛️</span>
     <h1>ExifTool Archaeo</h1>
-    <span>고고학 현장 사진 위치·방향 시각화</span>
-    <span style="margin-left:auto; color:#e94560; font-weight:600;">{len(features)}장</span>
+    <span class="sub">고고학 현장 사진 위치·방향 시각화</span>
+    <span style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
   </div>
   <div id="map"></div>
 
@@ -492,63 +581,77 @@ def write_map(records: list[dict], output_path: str):
   <script>
     const map = L.map('map').setView([{center_lat}, {center_lon}], 15);
 
-    // Base layers
-    const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-      attribution: '© OpenStreetMap contributors', maxZoom: 20
-    }});
+    // ── 베이스 레이어 ───────────────────────────────────────────────────────
     const satellite = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
-      {{ attribution: 'Tiles © Esri', maxZoom: 20 }}
+      {{ attribution: 'Tiles &copy; Esri', maxZoom: 20 }}
     );
-    satellite.addTo(map);
-    L.control.layers({{"위성 (Esri)": satellite, "지도 (OSM)": osm}}, {{}}, {{position:'topright'}}).addTo(map);
+    const osm = L.tileLayer(
+      'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+      {{ attribution: '&copy; OpenStreetMap contributors', maxZoom: 20 }}
+    );
+    // 하이브리드 = 위성 + 라벨 오버레이
+    const hybrid = L.layerGroup([
+      L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+        {{ attribution: 'Tiles &copy; Esri', maxZoom: 20 }}
+      ),
+      L.tileLayer(
+        'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}',
+        {{ opacity: 1, maxZoom: 20 }}
+      ),
+    ]);
 
-    // Arrow SVG icon factory
+    satellite.addTo(map);
+
+    L.control.layers(
+      {{ "🛰 위성": satellite, "🗺 지도 (OSM)": osm, "🛰+🏷 하이브리드": hybrid }},
+      {{}},
+      {{ position: 'topright', collapsed: false }}
+    ).addTo(map);
+
+    // ── 화살표 아이콘 ────────────────────────────────────────────────────────
     function makeArrowIcon(yawDeg, hasDir) {{
       const color = hasDir ? '#e94560' : '#718096';
-      const svg = `
-        <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
-          <circle cx="18" cy="18" r="10" fill="${{color}}" fill-opacity="0.25" stroke="${{color}}" stroke-width="2"/>
-          <circle cx="18" cy="18" r="3" fill="${{color}}"/>
-          ${{hasDir ? `<line x1="18" y1="18" x2="18" y2="5"
-            stroke="${{color}}" stroke-width="2.5" stroke-linecap="round"
-            transform="rotate(${{yawDeg}}, 18, 18)"/>
-          <polygon points="18,2 15,9 21,9"
-            fill="${{color}}"
-            transform="rotate(${{yawDeg}}, 18, 18)"/>` : ''}}
-        </svg>`;
+      const arrowSvg = hasDir ? `
+        <line x1="18" y1="18" x2="18" y2="4"
+          stroke="${{color}}" stroke-width="2.5" stroke-linecap="round"
+          transform="rotate(${{yawDeg}},18,18)"/>
+        <polygon points="18,1 14.5,9 21.5,9"
+          fill="${{color}}" transform="rotate(${{yawDeg}},18,18)"/>` : '';
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
+        <circle cx="18" cy="18" r="11" fill="${{color}}" fill-opacity="0.18" stroke="${{color}}" stroke-width="2"/>
+        <circle cx="18" cy="18" r="3.5" fill="${{color}}"/>
+        ${{arrowSvg}}
+      </svg>`;
       return L.divIcon({{
-        html: svg,
-        className: '',
-        iconSize: [36, 36],
-        iconAnchor: [18, 18],
-        popupAnchor: [0, -20],
+        html: svg, className: '',
+        iconSize: [36,36], iconAnchor: [18,18], popupAnchor: [0,-22],
       }});
     }}
 
+    // ── 마커 그룹 ─────────────────────────────────────────────────────────
     const features = {features_json};
     const markerGroup = L.featureGroup();
 
     features.forEach(f => {{
-      const icon = makeArrowIcon(f.yaw, f.has_dir);
-      const marker = L.marker([f.lat, f.lon], {{icon}})
-        .bindPopup(f.popup, {{maxWidth: 280}});
+      const marker = L.marker([f.lat, f.lon], {{ icon: makeArrowIcon(f.yaw, f.has_dir) }})
+        .bindPopup(f.popup, {{ maxWidth: 320, className: '' }});
       markerGroup.addLayer(marker);
     }});
 
     markerGroup.addTo(map);
-    map.fitBounds(markerGroup.getBounds().pad(0.15));
+    map.fitBounds(markerGroup.getBounds().pad(0.18));
 
-    // Legend
-    const legend = L.control({{position: 'bottomleft'}});
+    // ── 범례 ─────────────────────────────────────────────────────────────
+    const legend = L.control({{position:'bottomleft'}});
     legend.onAdd = () => {{
-      const d = L.DomUtil.create('div', 'legend');
+      const d = L.DomUtil.create('div','legend');
       d.innerHTML = `
         <b>범례</b><br>
-        <span class="legend-dot" style="background:#e94560;"></span> 방향 정보 있음<br>
-        <span class="legend-dot" style="background:#718096;"></span> 방향 정보 없음<br>
-        <span style="font-size:0.72rem; color:#a0aec0;">화살표 = 카메라(짐벌) 방향</span>
-      `;
+        <span class="legend-dot" style="background:#e94560"></span> 방향 정보 있음<br>
+        <span class="legend-dot" style="background:#718096"></span> 방향 정보 없음<br>
+        <span style="font-size:0.7rem;color:#a0aec0;">화살표 = 카메라(짐벌) 방향</span>`;
       return d;
     }};
     legend.addTo(map);

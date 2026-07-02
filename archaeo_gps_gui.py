@@ -11,12 +11,16 @@ from pathlib import Path
 
 # ── Windows 콘솔 UTF-8 ───────────────────────────────────────────────────────
 if sys.platform == "win32":
-    import io
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
-    except AttributeError:
-        pass  # GUI 모드에서 stdout.buffer 없을 수 있음
+    if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    if sys.stderr is not None and hasattr(sys.stderr, "reconfigure"):
+        try:
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # ── PyInstaller 번들 경로 처리 ───────────────────────────────────────────────
 def resource_path(relative_path: str) -> str:
@@ -256,15 +260,17 @@ def run_gui():
         return f or ""
 
     v_exiftool = make_row(sec2, "ExifTool 경로", 3, browse_exiftool, "찾아보기")
-    # 자동 탐색
+    
+    status_label = tk.Label(sec2, text="", style="Panel.TLabel", font=("Segoe UI", 9))
+    status_label.grid(row=4, column=1, sticky="w")
+    
+    # 자동 탐색 및 상태 표시
     try:
         auto_et = find_exiftool(None)
         v_exiftool.set(auto_et)
+        status_label.configure(text="✔ 자동 감지 성공: exiftool이 준비되었습니다.", fg="#48bb78", bg=PANEL)
     except FileNotFoundError:
-        pass
-    ttk.Label(sec2, text="(비워두면 자동 탐색 — 스크립트 폴더, PATH 순으로)",
-              style="Sub.TLabel", background=PANEL).grid(
-              row=4, column=1, sticky="w")
+        status_label.configure(text="⚠ 감지 실패: 같은 폴더에 exiftool.exe를 넣어주거나 직접 선택해 주세요.", fg="#f6ad55", bg=PANEL)
 
     # § 섹션 3 — 실행 버튼
     btn_frame = ttk.Frame(body)
