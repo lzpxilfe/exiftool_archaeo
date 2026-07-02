@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 archaeo_gps.py — 고고학 현장 사진 GPS·방향 추출 도구
 Archaeological field photo GPS & orientation extractor
@@ -251,8 +251,8 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
 
 
 def collect_images(input_path: str) -> list[str]:
-    """Collect all supported image paths from file or directory."""
-    p = Path(input_path)
+    """Collect all supported image paths from file or directory, resolved to absolute paths."""
+    p = Path(input_path).resolve().absolute()
     if p.is_file():
         return [str(p)]
     if p.is_dir():
@@ -260,7 +260,7 @@ def collect_images(input_path: str) -> list[str]:
         for ext in SUPPORTED_EXT:
             files.extend(p.glob(f"*{ext}"))
             files.extend(p.glob(f"*{ext.upper()}"))
-        return sorted(str(f) for f in set(files))
+        return sorted(str(f.resolve().absolute()) for f in set(files))
     raise FileNotFoundError(f"입력 경로를 찾을 수 없습니다: {input_path}")
 
 

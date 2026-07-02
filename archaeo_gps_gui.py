@@ -69,10 +69,34 @@ def run_gui():
     FONT_H1   = ("Segoe UI", 13, "bold")
 
     root = tk.Tk()
+    root.withdraw() # 메인 화면 임시 숨김 (스플래시 표시용)
     root.title("ExifTool Archaeo — 고고학 현장 GPS 추출기")
     root.configure(bg=BG)
     root.resizable(True, True)
     root.minsize(700, 580)
+
+    # ── 스플래시 로딩 화면 ───────────────────────────────────────────────────
+    splash = tk.Toplevel(root)
+    splash.overrideredirect(True)
+    splash.configure(bg=PANEL)
+    
+    # 스플래시 중앙 정렬 계산
+    sw = splash.winfo_screenwidth()
+    sh = splash.winfo_screenheight()
+    sp_w, sp_h = 420, 160
+    sp_x = (sw - sp_w) // 2
+    sp_y = (sh - sp_h) // 2
+    splash.geometry(f"{sp_w}x{sp_h}+{sp_x}+{sp_y}")
+    
+    sp_border = tk.Frame(splash, bg=ACCENT, bd=2)
+    sp_border.pack(fill="both", expand=True)
+    sp_inner = tk.Frame(sp_border, bg=PANEL)
+    sp_inner.pack(fill="both", expand=True, padx=2, pady=2)
+    
+    tk.Label(sp_inner, text="🏛️ ExifTool Archaeo", font=("Segoe UI", 16, "bold"), fg=ACCENT, bg=PANEL).pack(pady=(25, 6))
+    tk.Label(sp_inner, text="프로그램을 로딩 중입니다. 잠시만 기다려 주십시오...", font=("Segoe UI", 10), fg=TEXT, bg=PANEL).pack(pady=4)
+    tk.Label(sp_inner, text="v1.1 — 고고학 현장 GPS/방향 추출 분석 도구", font=("Segoe UI", 8), fg=SUBTEXT, bg=PANEL).pack(pady=(12, 0))
+    splash.update()
 
     # ── 아이콘 (번들 내 ico 파일 있으면 적용) ─────────────────────────────
     try:
@@ -461,6 +485,15 @@ def run_gui():
     sh = root.winfo_screenheight()
     root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
+    # 800ms 후 스플래시 창 파괴 및 메인 창 표출
+    def show_main():
+        try:
+            splash.destroy()
+        except Exception:
+            pass
+        root.deiconify()
+
+    root.after(800, show_main)
     root.mainloop()
 
 
