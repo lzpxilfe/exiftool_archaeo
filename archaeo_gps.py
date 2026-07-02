@@ -446,12 +446,13 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
 
 
 
+
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
 
 def write_map(records: list[dict], output_path: str):
-    """Generate a Leaflet.js HTML map with direction arrows and photo thumbnails."""
+    """Generate a Leaflet.js HTML map with direction arrows and a detailed side panel."""
 
     features = []
     for rec in records:
@@ -477,37 +478,12 @@ def write_map(records: list[dict], output_path: str):
 
         # Thumbnail (base64)
         thumb_b64 = extract_thumbnail(source_file) if source_file else None
-        thumb_html = (
-            f'<img src="data:image/jpeg;base64,{thumb_b64}" '
-            f'style="width:100%;border-radius:6px;margin-bottom:10px;'
-            f'box-shadow:0 2px 8px rgba(0,0,0,0.35);">'
-            if thumb_b64 else ""
-        )
 
+        # Mini popup content (just filename and coordinates)
         popup_html = f"""
-<div style="font-family:'Segoe UI',sans-serif;min-width:260px;max-width:300px;">
-  {thumb_html}
-  <div style="font-size:0.9rem;font-weight:700;margin-bottom:2px;">{fname}</div>
-  <div style="font-size:0.75rem;color:#888;margin-bottom:8px;">{dt}</div>
-  <hr style="border:none;border-top:1px solid #e2e8f0;margin:6px 0;">
-  <table style="font-size:0.8rem;border-collapse:collapse;width:100%;">
-    <tr><td style="color:#888;padding:2px 6px 2px 0;">📍 위치</td>
-        <td style="font-family:monospace;">{lat:.6f}, {lon:.6f}</td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;">⬆ 고도</td>
-        <td>{alt} m</td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;">🧭 방향</td>
-        <td><b>{yaw_display}</b></td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">짐벌 Yaw</td>
-        <td style="font-family:monospace;">{gimbal_yaw}°</td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">짐벌 Pitch</td>
-        <td style="font-family:monospace;">{gimbal_pitch}°</td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">짐벌 Roll</td>
-        <td style="font-family:monospace;">{gimbal_roll}°</td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;padding-left:16px;">기체 Yaw</td>
-        <td style="font-family:monospace;">{flight_yaw}°</td></tr>
-    <tr><td style="color:#888;padding:2px 6px 2px 0;">📷 카메라</td>
-        <td>{make} {model}</td></tr>
-  </table>
+<div style="font-family:'Segoe UI',sans-serif;font-size:0.8rem;line-height:1.4;">
+  <b>{fname}</b><br>
+  방향: {yaw_display}
 </div>"""
 
         features.append({
@@ -517,6 +493,16 @@ def write_map(records: list[dict], output_path: str):
             "has_dir": yaw is not None,
             "popup": popup_html,
             "fname": fname,
+            "dt": dt or "N/A",
+            "alt": alt if alt is not None else "N/A",
+            "make": make or "N/A",
+            "model": model or "N/A",
+            "gimbal_yaw": gimbal_yaw if gimbal_yaw is not None else "N/A",
+            "gimbal_pitch": gimbal_pitch if gimbal_pitch is not None else "N/A",
+            "gimbal_roll": gimbal_roll if gimbal_roll is not None else "N/A",
+            "flight_yaw": flight_yaw if flight_yaw is not None else "N/A",
+            "yaw_display": yaw_display,
+            "thumb_b64": thumb_b64 if thumb_b64 else "",
         })
 
     if not features:
@@ -532,32 +518,70 @@ def write_map(records: list[dict], output_path: str):
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ExifTool Archaeo — 사진 위치·방향 지도</title>
+  <title>ExifTool Archaeo — 고고학 현장 GPS 분석 맵</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; }}
+    body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
+    
     #header {{
       padding: 10px 20px;
       background: linear-gradient(135deg, #16213e, #0f3460);
       border-bottom: 2px solid #e94560;
       display: flex; align-items: center; gap: 12px;
+      z-index: 1000;
+      flex-shrink: 0;
     }}
-    #header h1 {{ font-size: 1.05rem; font-weight: 700; letter-spacing: 0.3px; }}
+    #header h1 {{ font-size: 1.05rem; font-weight: 700; letter-spacing: 0.3px; color: #fff; }}
     #header .sub {{ font-size: 0.8rem; color: #a0aec0; }}
-    #map {{ width: 100%; height: calc(100vh - 48px); }}
-    .leaflet-popup-content-wrapper {{
-      border-radius: 10px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-      padding: 0;
+    
+    #app-container {{
+      display: flex;
+      flex: 1;
+      width: 100%;
+      height: calc(100vh - 48px);
+      position: relative;
     }}
-    .leaflet-popup-content {{
-      margin: 14px 14px 10px 14px;
-      line-height: 1.5;
+    
+    #map {{
+      flex: 1;
+      height: 100%;
+      z-index: 1;
     }}
-    .leaflet-popup-tip-container {{ margin-top: -1px; }}
+    
+    #sidebar {{
+      width: 380px;
+      background: #16213e;
+      border-left: 2px solid #e94560;
+      height: 100%;
+      overflow-y: auto;
+      padding: 20px;
+      color: #eee;
+      z-index: 5;
+      flex-shrink: 0;
+      box-shadow: -4px 0 15px rgba(0,0,0,0.5);
+    }}
+    
+    .sidebar-table {{
+      width: 100%;
+      font-size: 0.85rem;
+      border-collapse: collapse;
+      margin-top: 15px;
+    }}
+    .sidebar-table tr {{
+      border-bottom: 1px solid #2d3748;
+    }}
+    .sidebar-table td {{
+      padding: 8px 6px;
+      vertical-align: middle;
+    }}
+    .sidebar-table td.label-col {{
+      color: #94a3b8;
+      width: 110px;
+    }}
+    
     .legend {{
-      background: rgba(22,33,62,0.93);
+      background: rgba(22, 33, 62, 0.93);
       padding: 10px 14px;
       border-radius: 8px;
       border: 1px solid #e94560;
@@ -565,7 +589,7 @@ def write_map(records: list[dict], output_path: str):
       color: #eee;
       line-height: 1.9;
     }}
-    .legend-dot {{ display:inline-block; width:11px; height:11px; border-radius:50%; margin-right:6px; vertical-align:middle; }}
+    .legend-dot {{ display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }}
   </style>
 </head>
 <body>
@@ -575,13 +599,26 @@ def write_map(records: list[dict], output_path: str):
     <span class="sub">고고학 현장 사진 위치·방향 시각화</span>
     <span style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
   </div>
-  <div id="map"></div>
+  
+  <div id="app-container">
+    <div id="map"></div>
+    <div id="sidebar">
+      <div id="sidebar-placeholder" style="text-align: center; margin-top: 60px; color: #a0aec0; line-height: 1.8;">
+        <span style="font-size: 3.5rem; display: block; margin-bottom: 15px;">📸</span>
+        <b style="color: #fff; font-size: 0.95rem;">사진 상세 정보 패널</b><br>
+        지도 위 화살표 마커를 클릭하시면<br>촬영 방향 정보와 사진 썸네일이<br>이곳에 상세히 연동되어 표시됩니다.
+      </div>
+      <div id="sidebar-content" style="display: none;">
+        <!-- JS가 동적으로 마커 데이터를 매핑하여 렌더링 -->
+      </div>
+    </div>
+  </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
     const map = L.map('map').setView([{center_lat}, {center_lon}], 15);
 
-    // ── 베이스 레이어 ───────────────────────────────────────────────────────
+    // ── 베이스 레이어 (Esri 위성 + CartoDB 하이브리드) ─────────────────────────
     const satellite = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
       {{ attribution: 'Tiles &copy; Esri', maxZoom: 20 }}
@@ -590,23 +627,35 @@ def write_map(records: list[dict], output_path: str):
       'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
       {{ attribution: '&copy; OpenStreetMap contributors', maxZoom: 20 }}
     );
-    // 하이브리드 = 위성 + 라벨 오버레이
+    
+    // CartoDB Positron Only Labels: 완벽한 투명 텍스트/도로 오버레이 레이어
+    const cartoLabels = L.tileLayer(
+      'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
+      {{ attribution: '&copy; CartoDB', maxZoom: 20, pane: 'shadowPane' }} // 라벨이 항상 마커 뒤, 지도 위에 보이도록 설정
+    );
+
+    // 하이브리드: 위성 타일 위에 CartoDB의 투명 라벨 레이어를 겹쳐서 출력
     const hybrid = L.layerGroup([
       L.tileLayer(
         'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
         {{ attribution: 'Tiles &copy; Esri', maxZoom: 20 }}
       ),
       L.tileLayer(
-        'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}',
-        {{ opacity: 1, maxZoom: 20 }}
-      ),
+        'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
+        {{ attribution: '&copy; CartoDB', maxZoom: 20 }}
+      )
     ]);
 
+    // 기본 맵으로 위성 레이어 설정
     satellite.addTo(map);
 
     L.control.layers(
-      {{ "🛰 위성": satellite, "🗺 지도 (OSM)": osm, "🛰+🏷 하이브리드": hybrid }},
-      {{}},
+      {{ 
+        "🛰 위성": satellite, 
+        "🛰+🏷 하이브리드 (위성+라벨)": hybrid,
+        "🗺 일반 지도 (OSM)": osm 
+      }},
+      {{ "🏷 도로/지명 라벨 (위성 단독 적용용)": cartoLabels }},
       {{ position: 'topright', collapsed: false }}
     ).addTo(map);
 
@@ -630,13 +679,46 @@ def write_map(records: list[dict], output_path: str):
       }});
     }}
 
-    // ── 마커 그룹 ─────────────────────────────────────────────────────────
+    // ── 마커 및 사이드바 바인딩 ───────────────────────────────────────────────
     const features = {features_json};
     const markerGroup = L.featureGroup();
 
     features.forEach(f => {{
       const marker = L.marker([f.lat, f.lon], {{ icon: makeArrowIcon(f.yaw, f.has_dir) }})
-        .bindPopup(f.popup, {{ maxWidth: 320, className: '' }});
+        .bindPopup(f.popup, {{ maxWidth: 200, className: '' }});
+      
+      // 클릭 시 오른쪽 사이드바에 사진 정보 로드
+      marker.on('click', function() {{
+        document.getElementById('sidebar-placeholder').style.display = 'none';
+        const contentDiv = document.getElementById('sidebar-content');
+        contentDiv.style.display = 'block';
+        
+        let imgHtml = '';
+        if (f.thumb_b64) {{
+          imgHtml = `<img src="data:image/jpeg;base64,${{f.thumb_b64}}" style="width:100%; border-radius:8px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); margin-bottom:15px; max-height:220px; object-fit:contain; background:#000;">`;
+        }} else {{
+          imgHtml = `<div style="width:100%; height:160px; background:#0f2044; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#718096; margin-bottom:15px; border: 1px dashed #2d3748;">썸네일 이미지 없음</div>`;
+        }}
+
+        contentDiv.innerHTML = `
+          ${{imgHtml}}
+          <h2 style="font-size:1.1rem; font-weight:700; margin-bottom:4px; color:#e94560; word-break:break-all; line-height:1.3;">${{f.fname}}</h2>
+          <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:15px;">🕐 촬영시각: ${{f.dt}}</div>
+          <hr style="border:none; border-top:1px solid #2d3748; margin-bottom:15px;">
+          
+          <table class="sidebar-table">
+            <tr><td class="label-col">📍 위도/경도</td><td style="font-family:monospace; font-weight:bold; color:#fff;">${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}</td></tr>
+            <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}} m</td></tr>
+            <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}°</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}°</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">짐벌 Roll</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_roll}}°</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}°</td></tr>
+            <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
+          </table>
+        `;
+      }});
+
       markerGroup.addLayer(marker);
     }});
 
