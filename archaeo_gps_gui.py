@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 archaeo_gps_gui.py — 고고학 현장 사진 GPS·방향 추출 도구 (GUI + CLI 통합)
 더블클릭 실행 → GUI 창
@@ -261,7 +261,7 @@ def run_gui():
 
     v_exiftool = make_row(sec2, "ExifTool 경로", 3, browse_exiftool, "찾아보기")
     
-    status_label = tk.Label(sec2, text="", style="Panel.TLabel", font=("Segoe UI", 9))
+    status_label = tk.Label(sec2, text="", bg=PANEL, fg=TEXT, font=("Segoe UI", 9))
     status_label.grid(row=4, column=1, sticky="w")
     
     # 자동 탐색 및 상태 표시
