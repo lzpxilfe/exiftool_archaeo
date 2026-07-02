@@ -1,171 +1,119 @@
-# ExifTool Archaeo
+# 🏛️ ExifTool Archaeo
 
-드론이나 DSLR로 찍은 사진에서 **GPS 좌표**와 **촬영 방향**을 꺼내,  
-고고학 현장에서 바로 쓸 수 있는 형태로 정리해주는 도구입니다.
+드론(DJI) 및 DSLR 카메라로 촬영한 현장 사진에서 **GPS 좌표**와 **촬영 방향(방위각)**을 추출하여, 고고학 조사의 정밀한 분석을 돕고 **GIS 호환 데이터** 및 **대화형 HTML 지도**로 자동 시각화해 주는 현장 친화형 분석 도구입니다.
 
-특히 **우거진 산림 지형**에서 사진만 보고 어느 방향을 찍었는지 알기 어려울 때,  
-DJI 드론 사진에 기록된 짐벌 방위각(GimbalYaw)을 읽어 나침반 방향(N/NE/SE…)까지 알려줍니다.
+특히 **산림 지형**이나 광범위한 고분군 조사에서 사진만 보고 촬영 방향을 가늠하기 어려울 때, 드론에 정밀하게 기록된 짐벌 방위각(`GimbalYawDegree`)을 완벽하게 파싱하여 16방위 나침반 방향(`N/NE/SE...`)과 함께 나타냅니다.
 
 ---
 
-## 어떤 상황에 쓰나요?
+## 🌟 주요 핵심 기능
 
-- 드론·DSLR로 촬영한 현장 사진의 좌표를 **한 번에 CSV로** 정리하고 싶을 때
-- GPS 좌표를 한국 측량 표준 좌표계(TM중부원점 등)로 **변환**해야 할 때
-- 각 사진을 **지도에서 위치와 방향**으로 확인하고 싶을 때
-- QGIS 등 GIS 소프트웨어에 바로 불러올 수 있는 형태로 **내보내고 싶을 때**
+*   **⚡ 초고속 EXIF 일괄 파싱**: `ExifTool` 배치 아규먼트 파일 전달 방식(`-@`)을 채택하여 한 번의 실행으로 수백 장의 사진 정보를 단 1~2초 만에 일괄 추출합니다.
+*   **🛣️ 윈도우 한글/공백 경로명 완벽 극복**: 윈도우 탐색기 특유의 한글 폴더 자모 결함(NFC/NFD 불일치) 및 공백이 포함된 파일 경로에서도 에러가 나지 않도록, 자체 8.3 단축 경로 변환 필터(`get_short_path_name`)를 내장했습니다.
+*   **🗺️ Leaflet.js 기반 대화형 고고학 지도**:
+    *   **멀티 타일 레이어**: Esri 위성지도, OSM 기본지도 및 국토교통부 공식 **브이월드(Vworld) 지도(위성/하이브리드/기본)**를 모두 연동하여 원클릭으로 전환 가능합니다.
+    *   **실시간 base64 썸네일 팝업**: 외부 이미지 서버가 없어도 개별 마커와 정보창 내부의 썸네일 이미지를 클릭해 바로 볼 수 있습니다.
+    *   **🔍 라이트박스 휠 줌 & 드래그**: 팝업된 사진을 **마우스 휠 스크롤로 자유롭게 확대/축소**하고 **드래그로 이동**하며 정밀 유구를 판독할 수 있습니다.
+    *   **🎯 Nadir(수직 촬영) 과녁 마커**: 짐벌이 수직 아래(`Gimbal Pitch <= -85°`)를 향한 사진은 과녁 모양 점선 마커로 시각화해 줍니다.
+*   **📡 국가지리정보 호환 좌표계(TM) 변환**: GPS 위경도(WGS84) 데이터를 QGIS 등 문화재 분포도 지형도에 즉시 중첩할 수 있도록 한국 공식 투영계(`TM중부원점`, `UTM-K`, `구 Bessel 원점` 등)로 정밀 변환해 CSV로 저장합니다.
 
 ---
 
-## 다운로드 및 실행 방법
+## 💻 윈도우 무설치 실행 파일 (.exe) 직접 만드는 방법
 
-> GitHub는 대용량 바이너리 파일 업로드가 제한되어 exe 파일을 직접 제공하지 않습니다.  
-> 아래 두 가지 방법 중 하나로 사용할 수 있습니다.
+> ⚠️ **알림**: GitHub는 파일당 용량 제한 및 서명 보안 이슈로 인해 컴파일된 큰 단독 실행 파일(`.exe`)을 리포지토리에 직접 제공하지 않습니다.
+> 하지만 아래의 가이드를 따라 몇 줄의 명령어 입력만으로 사용자의 PC에서 직접 최신 무설치 실행 파일을 안전하게 빌드하고 사용할 수 있습니다!
 
-### 방법 1 — 직접 빌드 (권장)
+### 1단계: 준비 단계 🛠️
+1. PC에 **Python**([공식 홈페이지 다운로드](https://www.python.org/downloads/))이 설치되어 있어야 합니다. (설치 시 **`Add Python to PATH`** 옵션을 꼭 체크하세요!)
+2. 리포지토리를 ZIP 파일로 다운로드하여 압축을 풀거나, Git 명령어로 클론합니다:
+   ```bash
+   git clone https://github.com/lzpxilfe/exiftool_archaeo.git
+   cd exiftool_archaeo
+   ```
 
-Python이 설치된 환경에서 아래 명령어를 순서대로 실행하면 `dist/` 폴더에 `ExifToolArchaeo.exe`가 생성됩니다.
-
+### 2단계: 필수 패키지 설치 📦
+명령 프롬프트(cmd) 또는 PowerShell을 열어 라이브러리와 빌더인 PyInstaller를 설치합니다:
 ```bash
-# 1. 저장소 내려받기
-git clone https://github.com/lzpxilfe/exiftool_archaeo.git
-cd exiftool_archaeo
-
-# 2. 의존성 설치
-pip install pyproj pandas pyinstaller
-
-# 3. exe 빌드
-pyinstaller archaeo_gps.spec
-
-# 4. exiftool.exe 복사 (https://exiftool.org 에서 다운로드)
-copy exiftool.exe dist\exiftool.exe
+pip install pandas pyproj Pillow pyinstaller
 ```
 
-빌드 후 `dist/` 폴더 안의 두 파일만 있으면 됩니다:
+### 3단계: ExifTool 코어 구성 📡
+1. [ExifTool 공식 홈페이지](https://exiftool.org/)에 접속합니다.
+2. 최신 Windows Executable 버전 (예: `exiftool-XX.XX.zip`)을 다운로드합니다.
+3. 압축을 해제하여 `exiftool(-k).exe` 파일을 얻은 뒤, 파일 이름을 **`exiftool.exe`**로 변경합니다.
+4. 이 `exiftool.exe` 파일을 프로젝트 내 **`dist`** 폴더(없다면 폴더 생성) 또는 프로젝트 루트 폴더에 넣어둡니다.
+   * *자세한 작동을 위해 `exiftool.exe`와 `exiftool_files` 디렉토리가 함께 구성되어 있어야 합니다.*
 
-```
-dist/
-  ├── ExifToolArchaeo.exe   ← 더블클릭으로 실행
-  └── exiftool.exe          ← 반드시 같은 폴더에 있어야 함
-```
-
-### 방법 2 — Python 스크립트로 직접 실행
-
-exe 없이 Python으로 바로 실행할 수도 있습니다.
-
+### 4단계: 실행 파일(.exe) 빌드 실행 ⚙️
+프로젝트 루트 디렉토리에서 PyInstaller 빌드 명령을 내립니다:
 ```bash
-pip install pyproj pandas
-python archaeo_gps.py -i ./사진폴더 -o output.csv --crs tm --map map.html
+pyinstaller archaeo_gps.spec --clean
 ```
+빌드 프로세스가 종료되면 **`dist/`** 폴더 아래에 단독형 무설치 프로그램인 **`ExifToolArchaeo.exe`**가 탄생합니다!
 
 ---
 
-## 사용 방법
+## 📂 최종 실행 환경 디렉토리 구조
+프로그램을 실행하려면 다음과 같이 빌드된 `ExifToolArchaeo.exe`와 ExifTool 구성 요소를 배치한 뒤 구동하면 됩니다:
 
-### GUI (더블클릭 실행)
+```text
+바탕화면 혹은 작업 폴더/
+  ├── ExifToolArchaeo.exe   # 👈 더블클릭하여 실행하는 메인 앱!
+  ├── exiftool.exe          # 👈 ExifTool 엔진 실행 파일
+  └── exiftool_files/       # 👈 ExifTool 라이브러리 폴더 (perl5*.dll 등 포함)
+```
+> 💡 **Tip**: `ExifToolArchaeo.exe`는 실행 시 자신의 CWD(작업 디렉토리) 및 같은 경로 상에 유효한 `exiftool.exe` 세트가 존재하는지 자가 검증을 진행하므로, 반드시 한 폴더에 함께 묶어 보관하십시오.
 
-`ExifToolArchaeo.exe`를 더블클릭하면 창이 열립니다.
+---
 
-1. **사진 폴더** — 분석할 사진이 들어있는 폴더를 선택
-2. **출력 CSV** — 결과를 저장할 파일 이름 지정
-3. **좌표계 변환** — 드롭다운에서 원하는 좌표계 선택
-4. **지도 생성** 체크 → 방향 화살표가 표시된 HTML 지도도 함께 저장
-5. **추출 실행** 클릭
+## 🗺️ 지원 투영 좌표계 (CRS) 목록
 
-### CLI (명령줄)
+### 🇰🇷 대한민국 현행 표준 좌표계 (GRS80 타원체)
 
+| 코드 | EPSG | 좌표계 원점 이름 | 주 사용 지역 및 설명 |
+| :--- | :--- | :--- | :--- |
+| **`tm`** ⭐ | **5186** | **TM 중부원점 (GRS80)** | **대한민국 내륙 지형도 표준 (기본값)** |
+| `tm_west` | 5185 | TM 서부원점 (GRS80) | 인천, 전라남도·북부 서해안 지역 |
+| `tm_east` | 5187 | TM 동부원점 (GRS80) | 경상남·북도 동해안, 영남 동부 |
+| `tm_eastsea`| 5188 | TM 동해원점 (GRS80) | 울릉도, 독도 관측 영역 |
+| `utmk` | 5179 | UTM-K 단일좌표계 | 국토교통부 표준 전국 단일 투영계 |
+
+### 📜 구 국가지리정보 좌표계 (Bessel 1841 타원체, 예전 문화재 도면 및 지형도)
+
+| 코드 | EPSG | 좌표계 원점 이름 |
+| :--- | :--- | :--- |
+| `tm_old` | 5174 | 구TM 중부원점 (Bessel) |
+| `tm_old_west`| 5173 | 구TM 서부원점 (Bessel) |
+| `tm_old_east`| 5176 | 구TM 동부원점 (Bessel) |
+| `tm_mod` | 5181 | 수정 중부원점 (Bessel 2010년 한시규격) |
+
+---
+
+## 🚀 사용 가이드
+
+### 1. GUI 그래픽 인터페이스 사용법
+`ExifToolArchaeo.exe`를 실행하면 깔끔한 설정 창이 뜹니다.
+
+1. **사진 폴더**: 분석할 드론/DSLR 사진들이 모여 있는 폴더를 선택합니다.
+2. **출력 CSV**: 변환된 측량 좌표가 작성될 엑셀 호환 CSV 파일의 경로를 설정합니다.
+3. **좌표계 선택**: 대상 현장의 도면 규격에 맞는 좌표계(예: GRS80 TM중부원점)를 고릅니다.
+4. **지도 생성**: 체크박스를 활성화하면, 동일한 경로에 HTML 입체 지도를 자동 배포합니다.
+5. **추출 실행**: 버튼을 클릭하면 실시간 변환 통계와 함께 완료 보고가 나타납니다.
+
+### 2. CLI 명령줄 실행법
+서버나 자동화 배치 스크립트에서 명령어로 돌릴 수 있습니다:
 ```bash
-# 기본 실행
-ExifToolArchaeo.exe -i C:\현장사진 -o output.csv
+# 기본 변환
+ExifToolArchaeo.exe -i D:\지표조사\드론사진 -o D:\지표조사\결과.csv
 
-# 좌표계 지정 + 지도 생성
-ExifToolArchaeo.exe -i C:\현장사진 -o output.csv --crs tm --map map.html
-
-# 구좌표계 사용 (Bessel 구TM중부원점)
-ExifToolArchaeo.exe -i C:\현장사진 -o output.csv --crs tm_old
+# 투영 좌표계 적용 및 HTML 지도 함께 내보내기
+ExifToolArchaeo.exe -i D:\지표조사\드론사진 -o D:\결과.csv --crs tm --map D:\현장위치도.html
 ```
 
 ---
 
-## 지원 좌표계
+## 🏛️ 라이선스 (License)
 
-### 한국 현행 (GRS80, 2010년 이후 국가 표준)
-
-| 코드 | EPSG | 이름 | 적용 지역 |
-|------|------|------|----------|
-| `tm` ⭐ | 5186 | TM중부원점 GRS80 | 한반도 내륙 대부분 |
-| `tm_west` | 5185 | TM서부원점 GRS80 | 서해안·서부 |
-| `tm_east` | 5187 | TM동부원점 GRS80 | 동해안·영남동부 |
-| `tm_eastsea` | 5188 | TM동해원점 GRS80 | 울릉도·독도 |
-| `utmk` | 5179 | UTM-K GRS80 | 한반도 통합 |
-
-### 한국 구좌표 (Bessel 1841, 2010년 이전 지형도·문화재 도면)
-
-| 코드 | EPSG | 이름 |
-|------|------|------|
-| `tm_old` | 5174 | 구TM중부원점 Bessel |
-| `tm_old_west` | 5173 | 구TM서부원점 Bessel |
-| `tm_old_east` | 5176 | 구TM동부원점 Bessel |
-| `tm_mod` | 5181 | 수정중부원점 Bessel (2010 경과조치) |
-| `tm_mod_west` | 5182 | 수정서부원점 Bessel |
-| `tm_mod_east` | 5183 | 수정동부원점 Bessel |
-
-### 국제 / 기타
-
-| 코드 | EPSG | 이름 |
-|------|------|------|
-| `utm52n` | 32652 | UTM Zone 52N (WGS84) |
-| `web_mercator` | 3857 | Web Mercator (Google·Kakao지도) |
-| `wgs84` | 4326 | WGS84 위경도 (변환 없음) |
-
-> EPSG 코드를 직접 입력할 수도 있습니다: `--crs epsg:5186`
-
----
-
-## 출력 결과
-
-### CSV 컬럼
-
-| 컬럼 | 설명 |
-|------|------|
-| `FileName` | 파일명 |
-| `DateTime` | 촬영 일시 |
-| `Lat_DD` / `Lon_DD` | 위경도 (십진수) |
-| `Alt_m` | 고도 (m) |
-| `CamDirection_deg` | 카메라 방위각 (0–360°) |
-| `CamDirection_cardinal` | 16방위 (N/NNE/NE…) |
-| `GimbalYaw/Pitch/Roll` | 짐벌 자세 (DJI) |
-| `FlightYaw/Pitch/Roll` | 기체 자세 (DJI) |
-| `Proj_X` / `Proj_Y` | 지정 좌표계 변환 좌표 |
-
-### HTML 지도
-
-- 위성 사진 배경 (Esri, OSM 전환 가능)
-- 각 사진 위치에 방향 화살표 표시
-- 클릭하면 방위각·고도·짐벌 정보 팝업
-
----
-
-## 지원 카메라
-
-| 종류 | 방향 정보 출처 |
-|------|--------------|
-| DJI 드론 (Mavic·Air·Mini 시리즈) | `GimbalYawDegree` (우선 적용) |
-| DSLR / 미러리스 + 외장 GPS | `GPSImgDirection` |
-| 스마트폰 | `GPSImgDirection` |
-
----
-
-## 요구사항
-
-- **Python** 3.10 이상 (스크립트 직접 실행 시)
-- **ExifTool** — [exiftool.org](https://exiftool.org) 에서 다운로드
-- **의존성** — `pip install pyproj pandas` (또는 `pip install -r requirements.txt`)
-
----
-
-## 라이선스
-
-이 저장소는 [ExifTool](https://github.com/exiftool/exiftool) (by Phil Harvey)의 포크입니다.  
-ExifTool은 Perl 라이선스를 따릅니다.  
-커스텀 스크립트(`archaeo_gps.py`, `archaeo_gps_gui.py`)는 MIT 라이선스로 배포됩니다.
+*   이 프로그램의 핵심 엔진은 Phil Harvey의 오픈소스 **[ExifTool](https://github.com/exiftool/exiftool)**을 호출하여 동작하며, ExifTool은 Perl License 규격을 따릅니다.
+*   고고학 전용 GPS 파싱 및 시각화용 커스텀 코드(`archaeo_gps.py`, `archaeo_gps_gui.py`)는 **MIT License** 하에 자유롭게 활용 및 수정 배포할 수 있습니다.

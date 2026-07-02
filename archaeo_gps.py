@@ -515,6 +515,7 @@ def extract_thumbnail(source_file: str, max_size: int = 320) -> str | None:
     resize to thumbnail, and return base64 JPEG string.
     """
     if not HAS_PILLOW:
+        print("⚠️  Pillow 라이브러리가 로드되지 않아 썸네일을 생성할 수 없습니다. (pip install Pillow)", file=sys.stderr)
         return None
     try:
         # 한글/공백 인코딩 꼬임 방지를 위해 8.3 단축 경로명으로 변환하여 Pillow open 실행!

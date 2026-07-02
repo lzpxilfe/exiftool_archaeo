@@ -35,6 +35,9 @@ a = Analysis(
         "tkinter.filedialog",
         "tkinter.messagebox",
         "tkinter.scrolledtext",
+        "PIL",
+        "PIL.Image",
+        "PIL.ImageOps",
     ],
     hookspath=[],
     hooksconfig={},
@@ -42,7 +45,7 @@ a = Analysis(
     excludes=[
         "matplotlib", "scipy", "numpy.distutils",
         "IPython", "jupyter", "notebook",
-        "PIL", "cv2", "sklearn",
+        "cv2", "sklearn",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
