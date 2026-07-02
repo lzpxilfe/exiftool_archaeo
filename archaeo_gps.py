@@ -207,26 +207,68 @@ def find_exiftool(hint: str | None) -> str:
                 return False
         return True
 
-    # 1. 힌트 경로 검사
-    if hint and is_valid_exiftool(hint):
-        return str(Path(hint).resolve().absolute())
-
-    # 2. 실행 파일(exe)과 같은 디렉토리 (PyInstaller frozen)
+    # 탐색할 디렉토리 후보 목록 생성
+    candidate_dirs = []
+    
+    # 1. 실행 파일(exe)과 같은 디렉토리 및 상위/하위 디렉토리 (PyInstaller frozen)
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
+        candidate_dirs.append(exe_dir)
+        candidate_dirs.append(exe_dir.parent)
+        candidate_dirs.append(exe_dir / "dist")
+        candidate_dirs.append(exe_dir.parent / "dist")
+        candidate_dirs.append(exe_dir / "ExifTool" / "dist")
+        candidate_dirs.append(exe_dir / "ExifTool")
+        
+    # 2. 스크립트 디렉토리 및 상위/하위 디렉토리
+    script_dir = Path(__file__).parent
+    candidate_dirs.append(script_dir)
+    candidate_dirs.append(script_dir / "dist")
+    candidate_dirs.append(script_dir.parent)
+    candidate_dirs.append(script_dir.parent / "dist")
+
+    # 3. 사용자 PC 환경의 고정 디렉토리 후보군
+    try:
+        user_home = Path.home()
+        candidate_dirs.append(user_home / "Desktop" / "ExifTool" / "dist")
+        candidate_dirs.append(user_home / "Desktop" / "ExifTool")
+        candidate_dirs.append(user_home / "Desktop")
+    except Exception:
+        pass
+        
+    candidate_dirs.append(Path(r"C:\Users\nuri9\Desktop\ExifTool\dist"))
+    candidate_dirs.append(Path(r"C:\Users\nuri9\Desktop\ExifTool"))
+    candidate_dirs.append(Path(r"C:\Users\nuri9\Desktop"))
+    candidate_dirs.append(Path(r"D:\ExifTool\dist"))
+    candidate_dirs.append(Path(r"D:\ExifTool"))
+    candidate_dirs.append(Path(r"G:\ExifTool"))
+
+    # 힌트 우선 처리
+    if hint:
+        if is_valid_exiftool(hint):
+            return str(Path(hint).resolve().absolute())
+        hint_path = Path(hint)
+        if hint_path.is_dir():
+            candidate_dirs.insert(0, hint_path)
+
+    # 중복 제거 및 유효한 경로 필터링
+    unique_dirs = []
+    for d in candidate_dirs:
+        try:
+            resolved = d.resolve().absolute()
+            if resolved.is_dir() and resolved not in unique_dirs:
+                unique_dirs.append(resolved)
+        except Exception:
+            continue
+
+    # 디렉토리 후보군 순회하며 exiftool 탐색
+    for d in unique_dirs:
         for name in ["exiftool.exe", "exiftool"]:
-            target = exe_dir / name
+            target = d / name
             if is_valid_exiftool(str(target)):
                 return str(target.resolve().absolute())
 
-    # 3. 스크립트 디렉토리
-    script_dir = Path(__file__).parent
-    for name in ["exiftool.exe", "exiftool"]:
-        target = script_dir / name
-        if is_valid_exiftool(str(target)):
-            return str(target.resolve().absolute())
-
-    # 4. 시스템 PATH
+    # 마지막 보루: 시스템 PATH에서 탐색
     for name in ["exiftool.exe", "exiftool"]:
         w = shutil.which(name)
         if w and is_valid_exiftool(w):
