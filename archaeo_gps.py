@@ -245,10 +245,12 @@ def get_short_path_name(long_name: str) -> str:
 
 
 def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
-    """Run exiftool sequentially for each file to ensure maximum compatibility with Unicode/Korean paths and prevent argument limits."""
+    """Run exiftool sequentially by setting the active directory (cwd) to the file's parent folder.
+    This bypasses Windows spacing/Unicode/Cross-drive argument limits completely.
+    """
     tag_args = [f"-{t}" for t in EXIF_TAGS]
     
-    # ExifTool 자체 경로 짧은 경로로 보정
+    # ExifTool 자체 경로도 짧은 경로(8.3)로 보정하여 공백 에러 방지
     exiftool_path = get_short_path_name(exiftool_path)
     
     startupinfo = None
@@ -258,13 +260,17 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
 
     results = []
     
-    # 윈도우 환경 한글/공백 절대경로 전송 오류 우회를 위해 각 이미지별 순차 처리
     for path in image_paths:
-        short_path = get_short_path_name(path)
-        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [short_path]
+        p_obj = Path(path)
+        file_name = p_obj.name
+        parent_dir = str(p_obj.parent)
+        
+        # 작업 디렉토리를 이미지 폴더로 바꾸고 파일명만 전달
+        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [file_name]
         try:
             result = subprocess.run(
                 cmd,
+                cwd=parent_dir,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -275,11 +281,14 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> list[dict]:
             if result.returncode in (0, 1) and result.stdout.strip():
                 data = json.loads(result.stdout)
                 if isinstance(data, list) and len(data) > 0:
-                    results.append(data[0])
+                    rec = data[0]
+                    # 원래 수집된 절대 경로로 SourceFile 값 보정
+                    rec["SourceFile"] = str(p_obj.resolve().absolute())
+                    results.append(rec)
             else:
-                print(f"⚠️  ExifTool 파일 처리 실패 ({Path(path).name}): code={result.returncode}", file=sys.stderr)
+                print(f"⚠️  ExifTool 파일 처리 실패 ({file_name}): code={result.returncode}", file=sys.stderr)
         except Exception as e:
-            print(f"⚠️  ExifTool 실행 오류 ({Path(path).name}): {e}", file=sys.stderr)
+            print(f"⚠️  ExifTool 실행 오류 ({file_name}): {e}", file=sys.stderr)
             continue
 
     return results
