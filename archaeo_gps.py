@@ -304,13 +304,13 @@ def get_short_path_name(long_name: str) -> str:
 
 
 def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict], list[str]]:
-    """Run exiftool sequentially for each file using its full absolute path.
-    Bypasses space issues via Python's built-in CreateProcessW argument quoting.
+    """Run exiftool in batch mode using an argument file (-@) with UTF-8 encoding.
+    This is the official ExifTool recommendation to bypass Windows Unicode / CJK filename issues.
     Returns (results, errors).
     """
-    tag_args = [f"-{t}" for t in EXIF_TAGS]
+    import tempfile
     
-    # ExifTool 자체 경로 절대 경로로 강제
+    tag_args = [f"-{t}" for t in EXIF_TAGS]
     exiftool_path = str(Path(exiftool_path).resolve().absolute())
     
     startupinfo = None
@@ -321,37 +321,62 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
     results = []
     errors = []
     
-    for path in image_paths:
-        abs_path = str(Path(path).resolve().absolute())
-        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8"] + tag_args + [abs_path]
+    # 1. 임시 파일 작성 (UTF-8 인코딩)
+    try:
+        # 윈도우 락 우회를 위해 delete=False 적용 후 블록 내에서 수동 기록
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.args', delete=False) as f:
+            # tag 인자들 먼저 기재
+            for tag in tag_args:
+                f.write(tag + "\n")
+            # 분석할 이미지들의 절대 경로 기재
+            for path in image_paths:
+                abs_path = str(Path(path).resolve().absolute())
+                f.write(abs_path + "\n")
+            temp_file_path = f.name
+            
+        # block을 나왔으므로 f.close() 되어 윈도우 파일 잠금 해제됨!
+        
+        # 2. ExifTool 일괄 실행 (Batch mode)
+        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8", "-@", temp_file_path]
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30, # 배치 모드이므로 타임아웃을 여유 있게 설정
+            startupinfo=startupinfo,
+        )
+        
+        # 3. 임시 파일 즉시 삭제
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=15,
-                startupinfo=startupinfo,
-            )
-            if result.returncode in (0, 1) and result.stdout.strip():
-                try:
-                    data = json.loads(result.stdout)
-                    if isinstance(data, list) and len(data) > 0:
-                        rec = data[0]
-                        rec["SourceFile"] = abs_path
-                        results.append(rec)
-                    else:
-                        errors.append(f"[{Path(path).name}] 빈 결과 또는 유효하지 않은 데이터")
-                except json.JSONDecodeError as je:
-                    errors.append(f"[{Path(path).name}] JSON 파싱 실패: {je}\n출력: {result.stdout[:200]}")
-            else:
-                err_msg = result.stderr.strip() if result.stderr else f"ExitCode={result.returncode}"
-                errors.append(f"[{Path(path).name}] ExifTool 오류: {err_msg}")
-        except Exception as e:
-            errors.append(f"[{Path(path).name}] 실행 중 예외: {str(e)}")
-            continue
+            os.unlink(temp_file_path)
+        except Exception:
+            pass
 
+        # 4. 결과 분석
+        if result.returncode in (0, 1) and result.stdout.strip():
+            try:
+                data = json.loads(result.stdout)
+                if isinstance(data, list):
+                    # 반환된 리스트의 SourceFile 경로들을 시스템 절대경로와 일치시킴
+                    for rec in data:
+                        if "SourceFile" in rec:
+                            sf_normalized = str(Path(rec["SourceFile"]).resolve().absolute())
+                            rec["SourceFile"] = sf_normalized
+                    results = data
+                else:
+                    errors.append("ExifTool 반환 데이터 형식 오류 (JSON 리스트 아님)")
+            except json.JSONDecodeError as je:
+                errors.append(f"JSON 파싱 실패: {je}\n출력: {result.stdout[:300]}")
+        else:
+            err_msg = result.stderr.strip() if result.stderr else f"ExitCode={result.returncode}"
+            errors.append(f"ExifTool 실행 실패: {err_msg}")
+            
+    except Exception as e:
+        errors.append(f"배치 실행 중 오류 발생: {str(e)}")
+        
     return results, errors
 
 
@@ -486,13 +511,15 @@ except ImportError:
 
 def extract_thumbnail(source_file: str, max_size: int = 320) -> str | None:
     """
-    Open the original photo, resize to thumbnail, return base64 JPEG string.
-    Returns None if Pillow is unavailable or file cannot be opened.
+    Open the original photo using Windows short path name to prevent encoding issues,
+    resize to thumbnail, and return base64 JPEG string.
     """
     if not HAS_PILLOW:
         return None
     try:
-        with _PILImage.open(source_file) as img:
+        # 한글/공백 인코딩 꼬임 방지를 위해 8.3 단축 경로명으로 변환하여 Pillow open 실행!
+        short_file_path = get_short_path_name(source_file)
+        with _PILImage.open(short_file_path) as img:
             # Preserve EXIF orientation
             try:
                 from PIL import ImageOps
@@ -503,7 +530,8 @@ def extract_thumbnail(source_file: str, max_size: int = 320) -> str | None:
             buf = _io.BytesIO()
             img.convert("RGB").save(buf, format="JPEG", quality=72)
             return _base64.b64encode(buf.getvalue()).decode()
-    except Exception:
+    except Exception as e:
+        print(f"⚠️  썸네일 추출 에러 ({source_file}): {e}", file=sys.stderr)
         return None
 
 
