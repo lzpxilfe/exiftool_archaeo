@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 archaeo_gps.py — 고고학 현장 사진 GPS·방향 추출 도구
 Archaeological field photo GPS & orientation extractor
@@ -19,10 +19,13 @@ import sys
 from pathlib import Path
 
 # Windows 콘솔 UTF-8 강제 (이모지·한글 출력)
+# console=False exe 에서는 stdout/stderr 가 None 이므로 반드시 None 체크 필요
 if sys.platform == "win32":
     import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+    if sys.stdout is not None and hasattr(sys.stdout, "buffer"):
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    if sys.stderr is not None and hasattr(sys.stderr, "buffer"):
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ---------------------------------------------------------------------------
 # Optional dependencies (graceful degradation)
@@ -69,13 +72,35 @@ CARDINALS_16 = [
     "W", "WNW", "NW", "NNW",
 ]
 
-# Supported output CRS (label → EPSG)
+# Supported output CRS (label -> EPSG)
+# -----------------------------------------------------------------------
 CRS_PRESETS = {
-    "wgs84":    "epsg:4326",
-    "tm":       "epsg:5186",   # TM중부원점 (GRS80) — 한국 표준
-    "utmk":     "epsg:5179",   # UTM-K (GRS80)
-    "utm52n":   "epsg:32652",  # UTM Zone 52N (WGS84)
-    "grs80":    "epsg:4737",   # GRS80 geographic
+
+    # WGS84 (기본 GPS 좌표)
+    "wgs84":           "epsg:4326",   # WGS84 지리좌표 (위경도 DD)
+
+    # 한국 현행 좌표계 (GRS80 타원체) - 2010년 이후 국가 표준
+    "tm":              "epsg:5186",   # TM중부원점 GRS80  [기본값, 가장 많이 쓰임]
+    "tm_west":         "epsg:5185",   # TM서부원점 GRS80  [서해안, 서부]
+    "tm_east":         "epsg:5187",   # TM동부원점 GRS80  [동해안, 영남동부]
+    "tm_eastsea":      "epsg:5188",   # TM동해원점 GRS80  [울릉도, 독도]
+    "utmk":            "epsg:5179",   # UTM-K GRS80       [국토지리정보원 통합]
+    "grs80_geo":       "epsg:4737",   # GRS80 지리좌표
+
+    # 한국 구좌표계 (Bessel 1841) - 2010년 이전 지형도/문화재 도면
+    "tm_old":          "epsg:5174",   # 구TM중부원점 Bessel  [구 내륙 표준]
+    "tm_old_west":     "epsg:5173",   # 구TM서부원점 Bessel
+    "tm_old_east":     "epsg:5176",   # 구TM동부원점 Bessel
+    "tm_old_eastsea":  "epsg:5177",   # 구TM동해원점 Bessel  [구 울릉]
+    "tm_mod":          "epsg:5181",   # 수정중부원점 Bessel  [2010년 경과조치]
+    "tm_mod_west":     "epsg:5182",   # 수정서부원점 Bessel
+    "tm_mod_east":     "epsg:5183",   # 수정동부원점 Bessel
+    "bessel_geo":      "epsg:4162",   # Bessel 지리좌표
+
+    # 국제 / 글로벌
+    "utm52n":          "epsg:32652",  # UTM Zone 52N  [한반도 전역]
+    "utm51n":          "epsg:32651",  # UTM Zone 51N  [서해 일부]
+    "web_mercator":    "epsg:3857",   # Web Mercator  [Google/Kakao 지도]
 }
 
 
@@ -553,14 +578,33 @@ def build_parser() -> argparse.ArgumentParser:
 예시:
   python archaeo_gps.py -i ./photos -o output.csv
   python archaeo_gps.py -i ./photos -o output.csv --crs tm --map map.html
-  python archaeo_gps.py -i . -o out.csv --crs utmk --exiftool ./exiftool.exe
+  python archaeo_gps.py -i . -o out.csv --crs tm_old --exiftool ./exiftool.exe
 
 지원 좌표계 (--crs):
-  wgs84   EPSG:4326  WGS84 (기본 GPS 좌표)
-  tm      EPSG:5186  TM중부원점 GRS80 (한국 국가 기준, 권장)
-  utmk    EPSG:5179  UTM-K GRS80
-  utm52n  EPSG:32652 UTM Zone 52N
-  또는 직접 입력: epsg:5186, epsg:32652, …
+  [한국 현행 GRS80]
+  tm           EPSG:5186  TM중부원점  (기본값, 한국 국가 표준)
+  tm_west      EPSG:5185  TM서부원점  (서해안, 서부)
+  tm_east      EPSG:5187  TM동부원점  (동해안, 영남동부)
+  tm_eastsea   EPSG:5188  TM동해원점  (울릉도, 독도)
+  utmk         EPSG:5179  UTM-K       (국토지리정보원 통합)
+  grs80_geo    EPSG:4737  GRS80 지리좌표
+
+  [한국 구좌표 Bessel 1841 - 2010년 이전 지형도/문화재 도면]
+  tm_old       EPSG:5174  구TM중부원점
+  tm_old_west  EPSG:5173  구TM서부원점
+  tm_old_east  EPSG:5176  구TM동부원점
+  tm_mod       EPSG:5181  수정중부원점  (2010년 경과조치)
+  tm_mod_west  EPSG:5182  수정서부원점
+  tm_mod_east  EPSG:5183  수정동부원점
+  bessel_geo   EPSG:4162  Bessel 지리좌표
+
+  [국제 / 글로벌]
+  utm52n       EPSG:32652 UTM Zone 52N  (한반도 전역)
+  utm51n       EPSG:32651 UTM Zone 51N  (서해 일부)
+  web_mercator EPSG:3857  Web Mercator  (Google/Kakao지도)
+  wgs84        EPSG:4326  WGS84 지리좌표  (변환 없음)
+
+  또는 EPSG 코드 직접 입력: epsg:5186, epsg:32652, …
         """,
     )
     parser.add_argument("-i", "--input", required=True,

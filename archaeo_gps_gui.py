@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 archaeo_gps_gui.py — 고고학 현장 사진 GPS·방향 추출 도구 (GUI + CLI 통합)
 더블클릭 실행 → GUI 창
@@ -201,13 +201,30 @@ def run_gui():
     crs_frame.grid(row=1, column=1, columnspan=2, sticky="w", pady=2)
 
     CRS_OPTIONS = [
-        ("TM중부원점  EPSG:5186  [기본, 한국 표준]", "tm"),
-        ("UTM-K  EPSG:5179",                         "utmk"),
-        ("UTM Zone 52N  EPSG:32652",                 "utm52n"),
-        ("WGS84  EPSG:4326  [변환 없음]",            "wgs84"),
+        # ── 한국 현행 (GRS80) ──────────────────────────────────────────
+        ("★ TM중부원점  EPSG:5186  [기본값, 한국 국가 표준]",  "tm"),
+        ("TM서부원점   EPSG:5185  [서해안·서부 지역]",        "tm_west"),
+        ("TM동부원점   EPSG:5187  [동해안·영남동부]",         "tm_east"),
+        ("TM동해원점   EPSG:5188  [울릉도·독도]",             "tm_eastsea"),
+        ("UTM-K        EPSG:5179  [국토지리정보원 통합]",      "utmk"),
+        ("GRS80 지리좌표 EPSG:4737",                          "grs80_geo"),
+        # ── 한국 구좌표 (Bessel 1841) ──────────────────────────────────
+        ("구TM중부원점  EPSG:5174  [Bessel, 구 내륙 표준]",   "tm_old"),
+        ("구TM서부원점  EPSG:5173  [Bessel]",                 "tm_old_west"),
+        ("구TM동부원점  EPSG:5176  [Bessel]",                 "tm_old_east"),
+        ("구TM동해원점  EPSG:5177  [Bessel, 구 울릉]",        "tm_old_eastsea"),
+        ("수정중부원점  EPSG:5181  [Bessel, 2010 경과조치]",  "tm_mod"),
+        ("수정서부원점  EPSG:5182  [Bessel]",                 "tm_mod_west"),
+        ("수정동부원점  EPSG:5183  [Bessel]",                 "tm_mod_east"),
+        ("Bessel 지리좌표 EPSG:4162",                         "bessel_geo"),
+        # ── 국제 / 글로벌 ──────────────────────────────────────────────
+        ("UTM Zone 52N  EPSG:32652  [한반도 전역, WGS84]",    "utm52n"),
+        ("UTM Zone 51N  EPSG:32651  [서해 일부, WGS84]",      "utm51n"),
+        ("Web Mercator  EPSG:3857   [Google·Kakao지도 기준]", "web_mercator"),
+        ("WGS84 지리좌표 EPSG:4326  [변환 없음]",             "wgs84"),
     ]
     v_crs = tk.StringVar(value="tm")
-    cb_crs = ttk.Combobox(crs_frame, textvariable=v_crs, width=38,
+    cb_crs = ttk.Combobox(crs_frame, textvariable=v_crs, width=52,
                           state="readonly",
                           values=[c[0] for c in CRS_OPTIONS])
     cb_crs.current(0)
