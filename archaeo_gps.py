@@ -449,20 +449,19 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
 
 
 
+
+
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
 
 def write_map(records: list[dict], output_path: str):
     """
-    Generate a Leaflet.js HTML map.
-    Features:
-      - Esri Satellite & OSM Map (Removed Vworld due to connectivity issues)
-      - CartoDB Light Only Labels for satellite hybrid overlay
-      - maxNativeZoom configured to allow deep zoom without "Map data not yet available" errors
-      - Clickable popups with high-quality base64 thumbnails (640px)
-      - Lightbox overlay to view full-size photo upon clicking the popup thumbnail
-      - Nadir (vertical downward) circle-target marker representation for 90-degree pitch shots
+    Generate a Leaflet.js HTML map with:
+      - Side panel layout
+      - Zoomable/Pannable photo Lightbox using mouse scroll wheel and drag
+      - Tile layers with custom CSS opacity and blend-mode (multiply) mix
+      - Nadir target icons for vertical shots (Pitch <= -85)
     """
 
     features = []
@@ -487,7 +486,7 @@ def write_map(records: list[dict], output_path: str):
 
         yaw_display = f"{yaw}° ({card})" if yaw is not None else "N/A"
 
-        # Determine if it's a nadir (vertical downward) shot (pitch <= -85)
+        # Nadir check (straight down)
         is_nadir = False
         if gimbal_pitch is not None:
             try:
@@ -496,7 +495,7 @@ def write_map(records: list[dict], output_path: str):
             except (ValueError, TypeError):
                 pass
 
-        # Extract higher resolution thumbnail (640px) for lightbox detail view
+        # High resolution base64 thumbnail (640px)
         thumb_b64 = extract_thumbnail(source_file, max_size=640) if source_file else None
 
         alt_val = f"{alt} m" if alt is not None else "N/A"
@@ -505,12 +504,18 @@ def write_map(records: list[dict], output_path: str):
         gy_val = f"{gimbal_yaw}°" if gimbal_yaw is not None else "N/A"
         fy_val = f"{flight_yaw}°" if flight_yaw is not None else "N/A"
 
+        popup_html = f"""
+<div style="font-family:'Segoe UI',sans-serif;font-size:0.8rem;">
+  <b>{fname}</b>
+</div>"""
+
         features.append({
             "lat": lat,
             "lon": lon,
             "yaw": yaw if yaw is not None else 0,
             "has_dir": yaw is not None,
             "is_nadir": is_nadir,
+            "popup": popup_html,
             "fname": fname,
             "dt": dt or "N/A",
             "alt": alt_val,
@@ -541,7 +546,7 @@ def write_map(records: list[dict], output_path: str):
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; overflow: hidden; }}
+    body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
     
     #header {{
       padding: 10px 20px;
@@ -549,129 +554,71 @@ def write_map(records: list[dict], output_path: str):
       border-bottom: 2px solid #e94560;
       display: flex; align-items: center; gap: 12px;
       height: 48px;
+      flex-shrink: 0;
+      z-index: 1000;
     }}
     #header h1 {{ font-size: 1.05rem; font-weight: 700; letter-spacing: 0.3px; color: #fff; }}
     #header .sub {{ font-size: 0.8rem; color: #a0aec0; }}
     
-    #map {{ 
-      width: 100%; 
-      height: calc(100vh - 48px); 
-      background: #101026;
+    #app-container {{
+      display: flex;
+      flex: 1;
+      width: 100%;
+      height: calc(100vh - 48px);
+      position: relative;
+    }}
+    
+    #map {{
+      flex: 1;
+      height: 100%;
       z-index: 1;
     }}
     
-    /* ── 세련된 가로형 와이드 팝업 스타일 커스텀 ── */
-    .leaflet-popup-content-wrapper {{
-      background: #16213e !important;
-      color: #eee !important;
-      border-radius: 12px !important;
-      box-shadow: 0 6px 24px rgba(0,0,0,0.5) !important;
-      border: 1px solid #e94560;
-      padding: 0 !important;
-    }}
-    .leaflet-popup-content {{
-      margin: 0 !important;
-      padding: 12px !important;
-      line-height: 1.4;
-    }}
-    .leaflet-popup-tip {{
-      background: #16213e !important;
-      border: 1px solid #e94560;
+    #sidebar {{
+      width: 380px;
+      background: #16213e;
+      border-left: 2px solid #e94560;
+      height: 100%;
+      overflow-y: auto;
+      padding: 20px;
+      color: #eee;
+      z-index: 5;
+      flex-shrink: 0;
+      box-shadow: -4px 0 15px rgba(0,0,0,0.5);
     }}
     
-    /* 와이드 팝업 컨테이너 */
-    .popup-container {{
-      display: flex;
-      gap: 16px;
-      min-width: 460px;
-      max-width: 520px;
-      align-items: flex-start;
-    }}
-    .popup-thumb-box {{
-      width: 180px;
-      flex-shrink: 0;
-    }}
-    .popup-thumb-box img {{
+    .sidebar-table {{
       width: 100%;
-      height: auto;
+      font-size: 0.85rem;
+      border-collapse: collapse;
+      margin-top: 15px;
+    }}
+    .sidebar-table tr {{
+      border-bottom: 1px solid #2d3748;
+    }}
+    .sidebar-table td {{
+      padding: 8px 6px;
+      vertical-align: middle;
+    }}
+    .sidebar-table td.label-col {{
+      color: #94a3b8;
+      width: 110px;
+    }}
+    
+    .sidebar-thumb {{
+      width: 100%;
       border-radius: 8px;
-      box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+      margin-bottom: 15px;
+      max-height: 220px;
+      object-fit: contain;
       background: #090e1a;
-      display: block;
       cursor: zoom-in;
       transition: transform 0.2s ease;
+      display: block;
     }}
-    .popup-thumb-box img:hover {{
-      transform: scale(1.03);
-    }}
-    .popup-meta-box {{
-      flex: 1;
-    }}
-    .popup-meta-box h3 {{
-      font-size: 0.95rem;
-      font-weight: 700;
-      color: #e94560;
-      margin-bottom: 2px;
-      word-break: break-all;
-    }}
-    .popup-meta-box .time-str {{
-      font-size: 0.75rem;
-      color: #94a3b8;
-      margin-bottom: 8px;
-    }}
-    .popup-table {{
-      width: 100%;
-      font-size: 0.78rem;
-      border-collapse: collapse;
-    }}
-    .popup-table tr {{
-      border-bottom: 1px solid #24355a;
-    }}
-    .popup-table tr:last-child {{
-      border-bottom: none;
-    }}
-    .popup-table td {{
-      padding: 5px 2px;
-    }}
-    .popup-table td.lbl {{
-      color: #a0aec0;
-      width: 80px;
-    }}
-    .popup-table td.val {{
-      font-weight: bold;
-      color: #fff;
-    }}
-    
-    /* ── 라이트박스(이미지 큰 확대 오버레이) 스타일 ── */
-    #lightbox {{
-      display: none;
-      position: fixed;
-      z-index: 9999;
-      top: 0; left: 0;
-      width: 100vw; height: 100vh;
-      background: rgba(10, 10, 25, 0.92);
-      align-items: center;
-      justify-content: center;
-      cursor: zoom-out;
-      opacity: 0;
-      transition: opacity 0.2s ease-in-out;
-    }}
-    #lightbox.active {{
-      display: flex;
-      opacity: 1;
-    }}
-    #lightbox img {{
-      max-width: 90%;
-      max-height: 90%;
-      border-radius: 8px;
-      box-shadow: 0 10px 40px rgba(0,0,0,0.8);
-      border: 2px solid #e94560;
-      transform: scale(0.95);
-      transition: transform 0.2s ease-in-out;
-      cursor: default;
-    }}
-    #lightbox.active img {{
-      transform: scale(1);
+    .sidebar-thumb:hover {{
+      transform: scale(1.02);
     }}
     
     .legend {{
@@ -684,6 +631,64 @@ def write_map(records: list[dict], output_path: str):
       line-height: 1.9;
     }}
     .legend-dot {{ display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }}
+    
+    /* ── 라이트박스(마우스 휠 줌 및 드래그 판 지원) ── */
+    #lightbox {{
+      display: none;
+      position: fixed;
+      z-index: 9999;
+      top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(10, 10, 25, 0.94);
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      user-select: none;
+    }}
+    #lightbox-img {{
+      max-width: 90%;
+      max-height: 90%;
+      border-radius: 6px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.8);
+      border: 2px solid #e94560;
+      cursor: grab;
+      transform-origin: center center;
+      transition: transform 0.05s ease-out;
+    }}
+    
+    .lightbox-close {{
+      position: absolute;
+      top: 20px; right: 20px;
+      font-size: 2rem; color: #fff;
+      cursor: pointer; z-index: 10000;
+      background: rgba(233, 69, 96, 0.8);
+      width: 45px; height: 45px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+      transition: background 0.2s;
+    }}
+    .lightbox-close:hover {{
+      background: rgb(233, 69, 96);
+    }}
+    .lightbox-guide {{
+      position: absolute;
+      bottom: 20px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(22, 33, 62, 0.85);
+      border: 1px solid #e94560;
+      padding: 8px 16px;
+      border-radius: 20px;
+      font-size: 0.8rem; color: #eee;
+      z-index: 10000;
+      pointer-events: none;
+    }}
+
+    /* ── Leaflet CSS Multiply (곱하기) 융합 레이어 스타일 ── */
+    .blend-multiply {{
+      mix-blend-mode: multiply;
+      filter: contrast(1.1) brightness(0.95);
+    }}
   </style>
 </head>
 <body>
@@ -694,23 +699,36 @@ def write_map(records: list[dict], output_path: str):
     <span style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
   </div>
   
-  <div id="map"></div>
+  <div id="app-container">
+    <div id="map"></div>
+    <div id="sidebar">
+      <div id="sidebar-placeholder" style="text-align: center; margin-top: 60px; color: #a0aec0; line-height: 1.8;">
+        <span style="font-size: 3.5rem; display: block; margin-bottom: 15px;">📸</span>
+        <b style="color: #fff; font-size: 0.95rem;">사진 상세 정보 패널</b><br>
+        지도 위 화살표 마커를 클릭하시면<br>촬영 방향 정보와 사진 썸네일이<br>이곳에 상세히 연동되어 표시됩니다.
+      </div>
+      <div id="sidebar-content" style="display: none;">
+        <!-- JS 동적 렌더링 -->
+      </div>
+    </div>
+  </div>
 
-  <!-- 라이트박스 컨테이너 -->
+  <!-- 라이트박스 구조 -->
   <div id="lightbox" onclick="closeLightbox()">
+    <div class="lightbox-close" onclick="closeLightbox()">&times;</div>
+    <div class="lightbox-guide">🖱️ 휠을 굴려 확대/축소, 마우스로 드래그하여 이동할 수 있습니다.</div>
     <img id="lightbox-img" src="" onclick="event.stopPropagation()">
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-    // 맵 선언 (확대 범위 오류 해결: maxZoom을 22로 주고 maxNativeZoom으로 에러 원천 차단)
+    // 맵 선언 (무제한 줌인 세팅)
     const map = L.map('map', {{
       maxZoom: 22,
       zoomControl: true
     }}).setView([{center_lat}, {center_lon}], 16);
 
-    // ── 베이스 레이어 구성 ──────────────────────────────────────────────────
-    // Esri Satellite: maxNativeZoom 18 설정으로 18레벨 초과 시 픽셀 자동 강제 확대 지원
+    // ── 베이스 레이어 및 오버레이 (곱하기 융합 및 투명도 조절 지원) ──
     const satellite = L.tileLayer(
       'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
       {{ 
@@ -720,7 +738,6 @@ def write_map(records: list[dict], output_path: str):
       }}
     );
 
-    // CartoDB Positron Only Labels: 투명 라벨 오버레이 레이어
     const labels = L.tileLayer(
       'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
       {{ 
@@ -739,37 +756,110 @@ def write_map(records: list[dict], output_path: str):
       }}
     );
 
-    // 하이브리드 조합 레이어 (위성 + CartoDB 라벨)
+    // 1. 위성 하이브리드 조합 레이어 (Esri 위성 + CartoDB 라벨)
     const hybrid = L.layerGroup([satellite, labels]);
 
-    // 기본 레이어로 완벽한 위성 하이브리드 자동 적용
+    // 2. OSM 곱하기 융합 레이어 (위성 위에 얹을 수도 있고 단독 사용도 가능하도록)
+    // CSS mix-blend-mode: multiply와 opacity: 0.65를 조합하여 위성사진과 완벽 융합
+    const osmMultiply = L.tileLayer(
+      'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+      {{ 
+        attribution: '&copy; OSM', 
+        maxNativeZoom: 19, 
+        maxZoom: 22,
+        className: 'blend-multiply',
+        opacity: 0.65
+      }}
+    );
+
+    // 곱하기 하이브리드 조합 레이어 (Esri 위성 + OSM 곱하기 오버레이)
+    const multiplyCombo = L.layerGroup([satellite, osmMultiply]);
+
+    // 기본 레이어로 일반 위성 하이브리드 적용
     hybrid.addTo(map);
 
     L.control.layers(
       {{ 
         "🛰 위성 하이브리드 (위성+라벨)": hybrid,
-        "🛰 위성 단독 (라벨 제거)": satellite,
-        "🗺 일반 지도 (OpenStreetMap)": osm 
+        "✖ 위성+OSM 곱하기 융합 (Multiply)": multiplyCombo,
+        "🛰 위성 단독": satellite,
+        "🗺 일반 지도 (OSM)": osm 
       }},
-      {{ "🏷 지명/도로명 라벨 (단독 토글)": labels }},
+      {{ 
+        "🏷 지명/도로명 라벨 (단독 토글)": labels,
+        "✖ OSM 곱하기 레이어 (개별 오버레이)": osmMultiply 
+      }},
       {{ position: 'topright', collapsed: false }}
     ).addTo(map);
 
-    // ── 라이트박스 제어 스크립트 ─────────────────────────────────────────────
+    // ── 라이트박스 휠 줌 및 드래그 판 구현 ──────────────────────────────────
+    let scale = 1;
+    let translateX = 0;
+    let translateY = 0;
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+
+    const lb = document.getElementById('lightbox');
+    const lbImg = document.getElementById('lightbox-img');
+
     function openLightbox(src) {{
-      const lb = document.getElementById('lightbox');
-      const img = document.getElementById('lightbox-img');
-      img.src = src;
+      lbImg.src = src;
+      scale = 1;
+      translateX = 0;
+      translateY = 0;
+      updateTransform();
+      
       lb.style.display = 'flex';
-      // 브라우저 렌더링 동기화를 위해 리플로우 발생 후 active 클래스 적용
-      setTimeout(() => lb.classList.add('active'), 10);
+      lb.offsetHeight;
+      lb.classList.add('active');
     }}
 
     function closeLightbox() {{
-      const lb = document.getElementById('lightbox');
       lb.classList.remove('active');
-      setTimeout(() => lb.style.display = 'none', 200);
+      setTimeout(() => {{
+        lb.style.display = 'none';
+        lbImg.src = '';
+      }}, 200);
     }}
+
+    function updateTransform() {{
+      lbImg.style.transform = `translate(${{translateX}}px, ${{translateY}}px) scale(${{scale}})`;
+    }}
+
+    // 마우스 휠 이벤트 (Zoom)
+    lbImg.addEventListener('wheel', function(e) {{
+      e.preventDefault();
+      const zoomFactor = 0.12;
+      if (e.deltaY < 0) {{
+        scale += zoomFactor;
+      }} else {{
+        scale -= zoomFactor;
+      }}
+      scale = Math.min(Math.max(0.4, scale), 6.0);
+      updateTransform();
+    }});
+
+    // 마우스 드래그 이벤트 (Pan)
+    lbImg.addEventListener('mousedown', function(e) {{
+      e.preventDefault();
+      isDragging = true;
+      startX = e.clientX - translateX;
+      startY = e.clientY - translateY;
+      lbImg.style.cursor = 'grabbing';
+    }});
+
+    window.addEventListener('mousemove', function(e) {{
+      if (!isDragging) return;
+      translateX = e.clientX - startX;
+      translateY = e.clientY - startY;
+      updateTransform();
+    }});
+
+    window.addEventListener('mouseup', function() {{
+      isDragging = false;
+      lbImg.style.cursor = 'grab';
+    }});
 
     // ── 아이콘 팩토리 (수직촬영 Nadir vs 경사촬영 Yaw 화살표) ───────────────────
     function makeCustomIcon(f) {{
@@ -777,7 +867,6 @@ def write_map(records: list[dict], output_path: str):
       let svgHtml = '';
 
       if (f.is_nadir) {{
-        // 수직 촬영 (Pitch 90도 부근): 카메라 렌즈 과녁(Nadir Target) 디자인 적용
         svgHtml = `
           <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
             <circle cx="18" cy="18" r="12" fill="none" stroke="${{color}}" stroke-width="2.5" stroke-dasharray="2 2"/>
@@ -787,7 +876,6 @@ def write_map(records: list[dict], output_path: str):
             <line x1="2" y1="18" x2="34" y2="18" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
           </svg>`;
       }} else {{
-        // 경사 촬영 (방향 화살표 지시)
         const arrowSvg = f.has_dir ? `
           <line x1="18" y1="18" x2="18" y2="4"
             stroke="${{color}}" stroke-width="2.5" stroke-linecap="round"
@@ -811,50 +899,48 @@ def write_map(records: list[dict], output_path: str):
       }});
     }}
 
-    // ── 와이드형 팝업 HTML 생성 ───────────────────────────────────────────────
-    function buildWidePopupHtml(f) {{
-      let imgHtml = '';
-      if (f.thumb_b64) {{
-        // 썸네일 이미지를 클릭하면 라이트박스로 크게 띄움
-        imgHtml = `<img src="data:image/jpeg;base64,${{f.thumb_b64}}" onclick="openLightbox(this.src)" title="클릭하면 확대">`;
-      }} else {{
-        imgHtml = `<div style="width:100%; height:135px; background:#0f2044; border-radius:6px; display:flex; align-items:center; justify-content:center; color:#718096; border: 1px dashed #2d3748; font-size:0.75rem;">이미지 없음</div>`;
-      }}
-
-      const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
-
-      return `
-        <div class="popup-container">
-          <div class="popup-thumb-box">
-            ${{imgHtml}}
-          </div>
-          <div class="popup-meta-box">
-            <h3>${{f.fname}}${{angleLabel}}</h3>
-            <div class="time-str">🕐 촬영: ${{f.dt}}</div>
-            <table class="popup-table">
-              <tr><td class="lbl">📍 위도/경도</td><td class="val" style="font-family:monospace;">${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}</td></tr>
-              <tr><td class="lbl">⬆ GPS 고도</td><td class="val">${{f.alt}}</td></tr>
-              <tr><td class="lbl">🧭 카메라 방향</td><td class="val" style="color:#e94560;">${{f.yaw_display}}</td></tr>
-              <tr><td class="lbl" style="padding-left:10px;">짐벌 Y/P/R</td><td class="val" style="font-family:monospace; font-size:0.72rem;">${{f.gimbal_yaw}} / ${{f.gimbal_pitch}} / ${{f.gimbal_roll}}</td></tr>
-              <tr><td class="lbl" style="padding-left:10px;">기체 Yaw</td><td class="val" style="font-family:monospace; font-size:0.72rem;">${{f.flight_yaw}}</td></tr>
-              <tr><td class="lbl">📷 장비 정보</td><td class="val" style="font-size:0.72rem;">${{f.make}} ${{f.model}}</td></tr>
-            </table>
-          </div>
-        </div>
-      `;
-    }}
-
-    // ── 마커 그룹 배치 ─────────────────────────────────────────────────────────
+    // ── 데이터 연동 ────────────────────────────────────────────────────────
     const features = {features_json};
     const markerGroup = L.featureGroup();
 
     features.forEach(f => {{
       const marker = L.marker([f.lat, f.lon], {{ icon: makeCustomIcon(f) }})
-        .bindPopup(buildWidePopupHtml(f), {{ 
-          maxWidth: 550, 
-          minWidth: 460, 
-          className: '' 
-        }});
+        .bindPopup(f.popup, {{ maxWidth: 200 }});
+      
+      // 마커 클릭 시 우측 사이드바 로드
+      marker.on('click', function() {{
+        document.getElementById('sidebar-placeholder').style.display = 'none';
+        const contentDiv = document.getElementById('sidebar-content');
+        contentDiv.style.display = 'block';
+        
+        let imgHtml = '';
+        if (f.thumb_b64) {{
+          imgHtml = `<img class="sidebar-thumb" src="data:image/jpeg;base64,${{f.thumb_b64}}" onclick="openLightbox(this.src)" title="클릭하면 마우스 휠로 확대/축소 가능">`;
+        }} else {{
+          imgHtml = `<div style="width:100%; height:160px; background:#0f2044; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#718096; margin-bottom:15px; border: 1px dashed #2d3748; font-size:0.8rem;">썸네일 이미지 없음</div>`;
+        }}
+
+        const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
+
+        contentDiv.innerHTML = `
+          ${{imgHtml}}
+          <h2 style="font-size:1.15rem; font-weight:700; margin-bottom:4px; color:#e94560; word-break:break-all; line-height:1.35;">${{f.fname}}${{angleLabel}}</h2>
+          <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:15px;">🕐 촬영시각: ${{f.dt}}</div>
+          <hr style="border:none; border-top:1px solid #2d3748; margin-bottom:15px;">
+          
+          <table class="sidebar-table">
+            <tr><td class="label-col">📍 위도/경도</td><td style="font-family:monospace; font-weight:bold; color:#fff;">${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}</td></tr>
+            <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}}</td></tr>
+            <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">짐벌 Roll</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_roll}}</td></tr>
+            <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
+            <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
+          </table>
+        `;
+      }});
+
       markerGroup.addLayer(marker);
     }});
 
@@ -867,10 +953,10 @@ def write_map(records: list[dict], output_path: str):
       const d = L.DomUtil.create('div','legend');
       d.innerHTML = `
         <b>범례</b><br>
-        <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=카메라 방향)<br>
+        <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=바라보는 방향)<br>
         <span class="legend-dot" style="background:#718096"></span> 방향 정보 없음<br>
         <span style="display:inline-block; width:12px; height:12px; margin-right:6px; border:2px dashed #e94560; border-radius:50%; vertical-align:middle;"></span> 수직 촬영 (Pitch 90° 부근 과녁 마커)<br>
-        <span style="font-size:0.7rem;color:#a0aec0;">* 마커 팝업 내 썸네일을 클릭하면 원본 사진이 화면에 크게 확대됩니다.</span>`;
+        <span style="font-size:0.7rem;color:#a0aec0;">* 사이드바 사진 클릭 후 마우스 휠을 굴려 확대/축소 및 드래그 이동이 가능합니다.</span>`;
       return d;
     }};
     legend.addTo(map);
