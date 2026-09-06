@@ -5,8 +5,9 @@ archaeo_gps_gui.py — 고고학 현장 사진 GPS·방향 추출 도구 (GUI + 
 인자 전달 실행 → CLI 모드 (기존 archaeo_gps.py 동작 유지)
 """
 
-import sys
+import json
 import os
+import sys
 from pathlib import Path
 
 # ── Windows 콘솔 UTF-8 ───────────────────────────────────────────────────────
@@ -38,9 +39,54 @@ if hasattr(sys, "_MEIPASS"):
 
 from archaeo_gps import (
     find_exiftool, collect_images, run_exiftool, parse_record,
-    write_csv, write_map, build_transformers, CRS_PRESETS,
-    HAS_PANDAS, HAS_PYPROJ,
+    write_csv, write_map, write_geojson, build_transformers, CRS_PRESETS,
+    HAS_PANDAS, HAS_PYPROJ, HAS_PILLOW, THUMB_SIZE_DEFAULT, __version__,
 )
+
+
+# ── 사용자 설정 저장 (마지막 사용 값 기억) ──────────────────────────────────
+def _settings_path() -> Path:
+    """OS 별 사용자 설정 파일 경로를 반환한다."""
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or Path.home())
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return base / "ExifToolArchaeo" / "settings.json"
+
+
+def load_settings() -> dict:
+    """저장된 설정을 읽는다. 없거나 손상되었으면 빈 dict 를 돌려준다."""
+    try:
+        return json.loads(_settings_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    """설정을 저장한다. 실패해도 프로그램 동작에는 영향을 주지 않는다."""
+    try:
+        path = _settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def open_in_file_manager(target: str) -> bool:
+    """탐색기/파인더로 폴더를 연다 (윈도우 전용 os.startfile 대체)."""
+    import subprocess
+    try:
+        if sys.platform == "win32":
+            os.startfile(target)          # noqa: S606  (윈도우 전용 API)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", target])
+        else:
+            subprocess.Popen(["xdg-open", target])
+        return True
+    except Exception:
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -67,6 +113,8 @@ def run_gui():
     FONT_MAIN = ("Segoe UI", 10)
     FONT_BOLD = ("Segoe UI", 10, "bold")
     FONT_H1   = ("Segoe UI", 13, "bold")
+
+    settings = load_settings()
 
     root = tk.Tk()
     root.withdraw() # 메인 화면 임시 숨김 (스플래시 표시용)
@@ -95,7 +143,7 @@ def run_gui():
     
     tk.Label(sp_inner, text="🏛️ ExifTool Archaeo", font=("Segoe UI", 16, "bold"), fg=ACCENT, bg=PANEL).pack(pady=(25, 6))
     tk.Label(sp_inner, text="프로그램을 로딩 중입니다. 잠시만 기다려 주십시오...", font=("Segoe UI", 10), fg=TEXT, bg=PANEL).pack(pady=4)
-    tk.Label(sp_inner, text="v1.1 — 고고학 현장 GPS/방향 추출 분석 도구", font=("Segoe UI", 8), fg=SUBTEXT, bg=PANEL).pack(pady=(12, 0))
+    tk.Label(sp_inner, text=f"v{__version__} — 고고학 현장 GPS/방향 추출 분석 도구", font=("Segoe UI", 8), fg=SUBTEXT, bg=PANEL).pack(pady=(12, 0))
     splash.update()
 
     # ── 아이콘 (번들 내 ico 파일 있으면 적용) ─────────────────────────────
@@ -129,6 +177,20 @@ def run_gui():
                     insertcolor=TEXT, borderwidth=0)
     style.configure("TCombobox",    fieldbackground=ENTRY_BG, foreground=TEXT,
                     selectbackground=ACCENT2, arrowcolor=TEXT)
+    # readonly 상태의 Combobox 는 clam 기본값이 회색 바탕/회색 글씨라 선택한
+    # 좌표계가 거의 보이지 않는다. 상태별 색을 명시해 가독성을 확보한다.
+    style.map("TCombobox",
+              fieldbackground=[("readonly", ENTRY_BG), ("disabled", PANEL)],
+              foreground=[("readonly", TEXT), ("disabled", SUBTEXT)],
+              selectbackground=[("readonly", ENTRY_BG)],
+              selectforeground=[("readonly", TEXT)],
+              background=[("readonly", ACCENT2), ("active", ACCENT2)],
+              arrowcolor=[("readonly", TEXT)])
+    # 펼쳐지는 목록(Listbox)은 ttk 스타일이 아닌 Tk 옵션으로 지정해야 한다.
+    root.option_add("*TCombobox*Listbox.background", ENTRY_BG)
+    root.option_add("*TCombobox*Listbox.foreground", TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    root.option_add("*TCombobox*Listbox.selectForeground", "white")
     style.configure("TCheckbutton", background=BG, foreground=TEXT)
     style.map("TCheckbutton",
               background=[("active", BG)],
@@ -165,7 +227,7 @@ def run_gui():
     tk.Label(header, text="ExifTool Archaeo",
              font=("Segoe UI", 14, "bold"), bg=ACCENT2, fg=TEXT).grid(
              row=0, column=1, sticky="w")
-    tk.Label(header, text="고고학 현장 사진 GPS·방향 추출 도구  v1.0",
+    tk.Label(header, text=f"고고학 현장 사진 GPS·방향 추출 도구  v{__version__}",
              font=("Segoe UI", 8), bg=ACCENT2, fg=SUBTEXT).grid(
              row=0, column=2, padx=16, sticky="e")
 
@@ -200,24 +262,48 @@ def run_gui():
     # § 섹션 1 — 입력 / 출력
     sec1 = make_section(body, "📂  입력 / 출력", 0)
 
+    def _initial_dir(current: str) -> str:
+        """대화상자가 마지막으로 쓰던 폴더에서 열리도록 시작 경로를 고른다."""
+        for cand in (current, settings.get("last_dir", "")):
+            if cand:
+                p = Path(cand)
+                p = p if p.is_dir() else p.parent
+                if p.is_dir():
+                    return str(p)
+        return ""
+
+    def _remember_dir(path: str) -> None:
+        if path:
+            p = Path(path)
+            settings["last_dir"] = str(p if p.is_dir() else p.parent)
+
     def browse_input():
-        d = filedialog.askdirectory(title="사진 폴더 선택")
-        return d or ""
+        d = filedialog.askdirectory(title="사진 폴더 선택",
+                                    initialdir=_initial_dir(v_input.get()) or None)
+        _remember_dir(d)
+        # 취소 시 기존 값을 지우지 않는다.
+        return d or v_input.get()
 
     def browse_output():
         f = filedialog.asksaveasfilename(
             title="CSV 저장 위치", defaultextension=".csv",
+            initialdir=_initial_dir(v_output.get()) or None,
             filetypes=[("CSV 파일", "*.csv"), ("모든 파일", "*.*")])
-        return f or ""
+        _remember_dir(f)
+        return f or v_output.get()
 
     def browse_map():
         f = filedialog.asksaveasfilename(
             title="지도 HTML 저장 위치", defaultextension=".html",
+            initialdir=_initial_dir(v_map_path.get()) or None,
             filetypes=[("HTML 파일", "*.html"), ("모든 파일", "*.*")])
-        return f or ""
+        _remember_dir(f)
+        return f or v_map_path.get()
 
     v_input  = make_row(sec1, "사진 폴더", 1, browse_input, "폴더 선택")
     v_output = make_row(sec1, "출력 CSV",  2, browse_output, "저장 위치")
+    v_input.set(settings.get("input", ""))
+    v_output.set(settings.get("output", ""))
 
     # § 섹션 2 — 설정
     sec2 = make_section(body, "⚙️  설정", 1)
@@ -251,11 +337,14 @@ def run_gui():
         ("Web Mercator  EPSG:3857   [Google·Kakao지도 기준]", "web_mercator"),
         ("WGS84 지리좌표 EPSG:4326  [변환 없음]",             "wgs84"),
     ]
-    v_crs = tk.StringVar(value="tm")
+    v_crs = tk.StringVar()
     cb_crs = ttk.Combobox(crs_frame, textvariable=v_crs, width=52,
                           state="readonly",
                           values=[c[0] for c in CRS_OPTIONS])
-    cb_crs.current(0)
+    # 저장된 좌표계가 있으면 복원, 없으면 첫 항목(TM중부원점)
+    _saved_crs = settings.get("crs", "tm")
+    _crs_index = next((i for i, c in enumerate(CRS_OPTIONS) if c[1] == _saved_crs), 0)
+    cb_crs.current(_crs_index)
     cb_crs.pack(side="left")
 
     # 지도 생성 체크박스 + 경로
@@ -265,24 +354,56 @@ def run_gui():
     map_frame.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(6, 0))
     map_frame.columnconfigure(1, weight=1)
 
-    v_make_map = tk.BooleanVar(value=True)
+    v_make_map = tk.BooleanVar(value=settings.get("make_map", True))
     ttk.Checkbutton(map_frame, text="HTML 지도 생성 (Leaflet)",
                     variable=v_make_map,
                     style="TCheckbutton").grid(row=0, column=0, sticky="w")
-    v_map_path = tk.StringVar()
+    v_map_path = tk.StringVar(value=settings.get("map_path", ""))
     ttk.Entry(map_frame, textvariable=v_map_path, width=32).grid(
         row=0, column=1, sticky="ew", padx=(8, 4))
     ttk.Button(map_frame, text="저장 위치", style="Browse.TButton",
                command=lambda: v_map_path.set(browse_map())).grid(
                row=0, column=2)
 
+    # ── 추가 옵션 ──────────────────────────────────────────────────────────
+    ttk.Label(sec2, text="추가 옵션", style="Panel.TLabel").grid(
+        row=3, column=0, sticky="nw", padx=(0, 10), pady=(8, 0))
+    opt_frame = ttk.Frame(sec2, style="Panel.TFrame")
+    opt_frame.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+
+    v_recursive = tk.BooleanVar(value=settings.get("recursive", False))
+    ttk.Checkbutton(opt_frame, text="하위 폴더까지 모두 검색",
+                    variable=v_recursive, style="TCheckbutton").grid(
+                    row=0, column=0, sticky="w", padx=(0, 16))
+
+    v_geojson = tk.BooleanVar(value=settings.get("geojson", False))
+    ttk.Checkbutton(opt_frame, text="GeoJSON 함께 저장 (QGIS)",
+                    variable=v_geojson, style="TCheckbutton").grid(
+                    row=0, column=1, sticky="w", padx=(0, 16))
+
+    v_thumbs = tk.BooleanVar(value=settings.get("thumbs", True))
+    cb_thumbs = ttk.Checkbutton(opt_frame, text="지도에 사진 썸네일 포함",
+                                variable=v_thumbs, style="TCheckbutton")
+    cb_thumbs.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+    if not HAS_PILLOW:
+        # Pillow 가 없으면 썸네일 자체가 불가능하므로 체크박스를 비활성화한다.
+        v_thumbs.set(False)
+        cb_thumbs.configure(state="disabled",
+                            text="지도에 사진 썸네일 포함 (Pillow 미설치)")
+
     # ExifTool 경로는 백그라운드에서 자동 탐색하므로 UI에서 제외
+    # (탐색 시 exiftool 을 실제로 실행해 보므로 느릴 수 있어 별도 스레드에서 수행한다.
+    #  메인 스레드에서 돌리면 창이 뜨기 전에 몇 초씩 멈춘 것처럼 보인다.)
     v_exiftool = tk.StringVar()
-    try:
-        auto_et = find_exiftool(None)
-        v_exiftool.set(auto_et)
-    except FileNotFoundError:
-        pass
+
+    def _detect_exiftool_async():
+        try:
+            found = find_exiftool(None)
+        except FileNotFoundError:
+            found = ""
+        root.after(0, lambda: v_exiftool.set(found))
+
+    threading.Thread(target=_detect_exiftool_async, daemon=True).start()
 
     # § 섹션 3 — 실행 버튼
     btn_frame = ttk.Frame(body)
@@ -337,12 +458,19 @@ def run_gui():
                          style="Run.TButton", command=lambda: start_run())
     run_btn.pack()
 
+    def set_progress(value: float):
+        """진행률 갱신 — Tk 변수는 반드시 메인 스레드에서 건드려야 한다."""
+        root.after(0, lambda: progress_var.set(value))
+
     def start_run():
         # 입력 검증
         inp = v_input.get().strip()
         out = v_output.get().strip()
         if not inp:
             messagebox.showwarning("입력 오류", "사진 폴더를 선택해 주세요.")
+            return
+        if not Path(inp).exists():
+            messagebox.showwarning("입력 오류", f"사진 폴더를 찾을 수 없습니다:\n{inp}")
             return
         if not out:
             messagebox.showwarning("입력 오류", "출력 CSV 저장 위치를 선택해 주세요.")
@@ -356,6 +484,13 @@ def run_gui():
                 map_path = str(Path(out).with_suffix(".html"))
                 v_map_path.set(map_path)
 
+        geojson_path = ""
+        if v_geojson.get():
+            geojson_path = str(Path(out).with_suffix(".geojson"))
+
+        recursive = v_recursive.get()
+        thumb_size = THUMB_SIZE_DEFAULT if v_thumbs.get() else 0
+
         # CRS 결정
         crs_label = v_crs.get()
         crs_code = next((c[1] for c in CRS_OPTIONS if c[0] == crs_label), "tm")
@@ -364,18 +499,23 @@ def run_gui():
         # ExifTool 감지 여부 실시간 확인 및 안내
         try:
             find_exiftool(v_exiftool.get().strip() or None)
-        except FileNotFoundError:
-            messagebox.showerror(
-                "ExifTool 누락",
-                "exiftool.exe를 찾을 수 없습니다.\n\n"
-                "ExifToolArchaeo.exe 실행 파일과 동일한 폴더에 exiftool.exe 파일을 복사해서 넣어주십시오."
-            )
+        except FileNotFoundError as e:
+            messagebox.showerror("ExifTool 누락", str(e))
             return
 
         et_path_hint = v_exiftool.get().strip() or None
 
+        # 다음 실행을 위해 현재 설정을 저장한다.
+        settings.update({
+            "input": inp, "output": out, "crs": crs_code,
+            "make_map": v_make_map.get(), "map_path": v_map_path.get().strip(),
+            "recursive": recursive, "geojson": v_geojson.get(),
+            "thumbs": v_thumbs.get(),
+        })
+        save_settings(settings)
+
         run_btn.configure(state="disabled")
-        progress_var.set(0)
+        set_progress(0)
         log_text.configure(state="normal")
         log_text.delete("1.0", "end")
         log_text.configure(state="disabled")
@@ -392,17 +532,20 @@ def run_gui():
                     return
 
                 # 2. 이미지 목록
-                log("▶ 이미지 목록 수집 중…", "info")
+                scope = "하위 폴더 포함" if recursive else "선택 폴더만"
+                log(f"▶ 이미지 목록 수집 중… ({scope})", "info")
                 try:
-                    images = collect_images(inp)
+                    images = collect_images(inp, recursive=recursive)
                 except FileNotFoundError as e:
                     log(f"✘ {e}", "err")
                     return
                 if not images:
                     log(f"✘ 지원 이미지 파일 없음: {inp}", "err")
+                    if not recursive:
+                        log("  힌트: '하위 폴더까지 모두 검색' 옵션을 켜 보세요.", "warn")
                     return
                 log(f"✔ 이미지 {len(images)}장 발견", "ok")
-                progress_var.set(10)
+                set_progress(10)
 
                 # 3. EXIF 추출
                 log("▶ EXIF 데이터 추출 중… (잠시 기다려 주세요)", "info")
@@ -418,50 +561,84 @@ def run_gui():
                 gps_ok = sum(1 for r in records if r["Lat_DD"] is not None)
                 dir_ok = sum(1 for r in records if r["CamDirection_deg"] is not None)
                 log(f"✔ GPS: {gps_ok}/{len(records)}장  방향: {dir_ok}/{len(records)}장", "ok")
-                progress_var.set(50)
+                if gps_ok == 0:
+                    log("⚠ GPS 좌표가 있는 사진이 없습니다. 지도는 생성되지 않습니다.", "warn")
+                set_progress(45)
 
                 # 4. 좌표 변환
                 transformer = None
+                used_crs = ""
                 if HAS_PYPROJ and crs_code != "wgs84":
                     log(f"▶ 좌표 변환: WGS84 → {target_crs}", "info")
                     transformer = build_transformers(target_crs)
                     if transformer:
-                        log(f"✔ 좌표 변환 준비 완료", "ok")
+                        used_crs = target_crs
+                        log("✔ 좌표 변환 준비 완료", "ok")
+                    else:
+                        log(f"⚠ 좌표계 '{target_crs}' 초기화 실패 → 변환 없이 진행", "warn")
                 elif not HAS_PYPROJ:
                     log("⚠ pyproj 미설치 → 좌표 변환 생략", "warn")
-                progress_var.set(65)
+                set_progress(55)
 
                 # 5. CSV 저장
                 log(f"▶ CSV 저장: {out}", "info")
                 Path(out).parent.mkdir(parents=True, exist_ok=True)
-                write_csv(records, out, transformer=transformer, target_crs=target_crs)
+                write_csv(records, out, transformer=transformer, target_crs=used_crs)
                 log(f"✔ CSV 저장 완료 ({len(records)}개)", "ok")
-                progress_var.set(80)
+                set_progress(65)
 
-                # 6. 지도 생성
+                # 6. GeoJSON 저장
+                saved_geojson = ""
+                if geojson_path:
+                    log(f"▶ GeoJSON 저장: {geojson_path}", "info")
+                    if write_geojson(records, geojson_path):
+                        saved_geojson = geojson_path
+                        log("✔ GeoJSON 저장 완료", "ok")
+                    else:
+                        log("⚠ GPS 데이터가 없어 GeoJSON을 만들지 못했습니다.", "warn")
+                set_progress(70)
+
+                # 7. 지도 생성 (썸네일 추출 진행률을 실시간으로 반영)
+                saved_map = ""
                 if map_path:
                     log(f"▶ 지도 생성: {map_path}", "info")
-                    write_map(records, map_path)
-                    log(f"✔ 지도 저장 완료", "ok")
-                progress_var.set(95)
 
-                # 7. 요약
+                    last_pct = [-1]
+
+                    def thumb_progress(done, total):
+                        # 썸네일 단계가 전체 진행률의 70-95% 구간을 차지한다.
+                        set_progress(70 + 25 * done / total)
+                        pct = done * 100 // total
+                        # 로그 폭주를 막기 위해 10% 단위로만 기록한다.
+                        if pct // 10 != last_pct[0] // 10:
+                            last_pct[0] = pct
+                            log(f"  🖼 썸네일 {done}/{total} ({pct}%)", "")
+
+                    if write_map(records, map_path, thumb_size=thumb_size,
+                                 progress=thumb_progress if thumb_size > 0 else None):
+                        saved_map = map_path
+                        log("✔ 지도 저장 완료", "ok")
+                    else:
+                        log("⚠ GPS 데이터가 없어 지도를 만들지 못했습니다.", "warn")
+                set_progress(95)
+
+                # 8. 요약
                 log("", "")
                 log("─" * 52, "")
-                log(f"{'파일명':<22} {'방향(°)':<10} {'방향':<5} {'위도':>11}", "info")
+                log(f"{'파일명':<22} {'방향(°)':<10} {'방위':<5} {'위도':>11}", "info")
                 log("─" * 52, "")
                 for r in records:
                     lat_s = f"{r['Lat_DD']:.5f}" if r["Lat_DD"] is not None else "N/A"
                     dir_s = f"{r['CamDirection_deg']:.1f}" if r["CamDirection_deg"] is not None else "N/A"
-                    card  = r.get("CamDirection_cardinal", "")
-                    fname = r["FileName"][:20]
+                    card  = r.get("CamDirection_cardinal", "") or "-"
+                    fname = str(r["FileName"])[:20]
                     log(f"{fname:<22} {dir_s:<10} {card:<5} {lat_s:>11}", "")
                 log("─" * 52, "")
                 log("✅ 모든 작업 완료!", "ok")
-                progress_var.set(100)
+                set_progress(100)
 
                 # 완료 알림 (메인 스레드에서 실행)
-                root.after(200, lambda: _done_dialog(out, map_path))
+                root.after(200, lambda: _done_dialog(out, saved_map, saved_geojson))
 
             except Exception as e:
                 log(f"✘ 예상치 못한 오류: {e}", "err")
@@ -472,13 +649,18 @@ def run_gui():
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _done_dialog(csv_path, map_path):
-        msg = f"CSV 저장 완료:\n{csv_path}"
+    def _done_dialog(csv_path, map_path="", geojson_path=""):
+        lines = [f"CSV: {csv_path}"]
+        if geojson_path:
+            lines.append(f"GeoJSON: {geojson_path}")
         if map_path:
-            msg += f"\n\n지도 저장 완료:\n{map_path}"
+            lines.append(f"지도: {map_path}")
+        msg = "저장이 완료되었습니다.\n\n" + "\n".join(lines)
         if messagebox.askyesno("완료!", msg + "\n\n출력 폴더를 열겠습니까?"):
             folder = str(Path(csv_path).parent)
-            os.startfile(folder)
+            if not open_in_file_manager(folder):
+                messagebox.showinfo("폴더 열기 실패",
+                                    f"폴더를 자동으로 열지 못했습니다.\n직접 열어 주세요:\n{folder}")
 
     # ── 창 중앙 배치 ────────────────────────────────────────────────────────
     root.update_idletasks()
@@ -496,6 +678,23 @@ def run_gui():
         root.deiconify()
 
     root.after(800, show_main)
+
+    # 창을 닫을 때 현재 입력값을 저장해 다음 실행에서 그대로 복원되게 한다.
+    def on_close():
+        settings.update({
+            "input": v_input.get().strip(),
+            "output": v_output.get().strip(),
+            "crs": next((c[1] for c in CRS_OPTIONS if c[0] == v_crs.get()), "tm"),
+            "make_map": v_make_map.get(),
+            "map_path": v_map_path.get().strip(),
+            "recursive": v_recursive.get(),
+            "geojson": v_geojson.get(),
+            "thumbs": v_thumbs.get(),
+        })
+        save_settings(settings)
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
 
 

@@ -7,16 +7,23 @@ Usage:
     python archaeo_gps.py -i ./photos -o output.csv
     python archaeo_gps.py -i ./photos -o output.csv --crs epsg:5186 --map map.html
     python archaeo_gps.py -i ./photos -o output.csv --exiftool ./exiftool.exe
+    python archaeo_gps.py -i ./photos -o output.csv --recursive --geojson out.geojson
+
+환경 변수:
+    EXIFTOOL_PATH  exiftool 실행 파일(또는 그 폴더)의 경로를 직접 지정
 """
 
 import argparse
+import html
 import json
-import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+__version__ = "1.2.0"
 
 # Windows 콘솔 UTF-8 강제 (이모지·한글 출력)
 # console=False exe 에서는 stdout/stderr 가 None 이므로 반드시 None 체크 필요
@@ -51,7 +58,35 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SUPPORTED_EXT = {".jpg", ".jpeg", ".tif", ".tiff", ".dng", ".arw", ".cr2", ".nef"}
+SUPPORTED_EXT = {
+    # 일반 이미지
+    ".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif",
+    ".tif", ".tiff",
+    # RAW (제조사별)
+    ".dng",           # Adobe / DJI
+    ".arw", ".sr2",   # Sony
+    ".cr2", ".cr3",   # Canon
+    ".nef", ".nrw",   # Nikon
+    ".orf",           # Olympus / OM System
+    ".rw2",           # Panasonic
+    ".raf",           # Fujifilm
+    ".pef",           # Pentax
+    ".3fr",           # Hasselblad
+}
+
+# ── 동작 파라미터 (하드코딩 대신 한 곳에서 관리) ────────────────────────────
+EXIFTOOL_TIMEOUT_BASE = 30      # ExifTool 배치 실행 기본 타임아웃(초)
+EXIFTOOL_TIMEOUT_PER_IMAGE = 0.15  # 이미지 1장당 추가 허용 시간(초)
+EXIFTOOL_TIMEOUT_MAX = 900      # 타임아웃 상한(초)
+EXIFTOOL_PROBE_TIMEOUT = 5      # exiftool 자가 검증 실행 타임아웃(초)
+
+THUMB_SIZE_DEFAULT = 640        # 지도 팝업 썸네일 최대 변 길이(px)
+THUMB_QUALITY_DEFAULT = 72      # 썸네일 JPEG 품질(1-95)
+THUMB_WORKERS_MAX = 8           # 썸네일 병렬 추출 최대 스레드 수
+
+NADIR_PITCH_THRESHOLD = -85.0   # 이 값 이하의 짐벌 Pitch는 수직(Nadir) 촬영으로 간주
+
+ENV_EXIFTOOL_PATH = "EXIFTOOL_PATH"  # exiftool 경로 지정용 환경 변수명
 
 EXIF_TAGS = [
     "FileName",
@@ -152,12 +187,30 @@ def dms_to_dd(dms_str: str) -> float | None:
     return dd
 
 
-def altitude_to_float(alt_str: str) -> float | None:
-    """Extract numeric altitude from ExifTool string like '525.2 m Above Sea Level'."""
+def altitude_to_float(alt_str, alt_ref=None) -> float | None:
+    """ExifTool 고도 문자열에서 숫자를 추출한다.
+
+    '525.2 m Above Sea Level' -> 525.2
+    '12.5 m Below Sea Level'  -> -12.5   (해수면 아래는 음수로 변환)
+
+    alt_ref 는 GPSAltitudeRef (0=Above, 1=Below) 값으로, 문자열에 방향
+    표기가 없는 경우(-n 옵션 등)의 보조 판단에 쓰인다.
+    """
     if alt_str is None:
         return None
-    m = re.search(r"([-\d.]+)", str(alt_str))
-    return float(m.group(1)) if m else None
+    m = re.search(r"(-?\d+(?:\.\d+)?)", str(alt_str))
+    if not m:
+        return None
+    val = float(m.group(1))
+
+    below = "below sea level" in str(alt_str).lower()
+    if not below and alt_ref is not None:
+        ref_s = str(alt_ref).strip().lower()
+        below = ref_s.startswith("1") or "below" in ref_s
+
+    if below:
+        val = -abs(val)
+    return val
 
 
 def deg_to_cardinal(deg: float | None, points: int = 16) -> str:
@@ -177,105 +230,141 @@ def normalize_yaw(yaw: float | None) -> float | None:
     return yaw % 360
 
 
-def find_exiftool(hint: str | None) -> str:
-    """Locate exiftool executable with strict validation for split perl packages (exiftool_files)."""
-    import shutil
-    
-    def is_valid_exiftool(path_str: str) -> bool:
-        p = Path(path_str)
-        if not p.is_file():
-            return False
-            
-        parent_dir = p.parent
-        has_files_dir = (parent_dir / "exiftool_files").is_dir()
-        
-        # 분리형인데 폴더가 없거나 단독형인데 내부 Perl DLL 손상이 의심되는 경우 자가 검증 실행
-        if p.name.lower() in ("exiftool.exe", "exiftool") and not has_files_dir:
-            startupinfo = None
-            if os.name == 'nt':
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            try:
-                res = subprocess.run(
-                    [str(p.resolve().absolute()), "-echo", "OK"],
-                    capture_output=True, text=True, timeout=3,
-                    startupinfo=startupinfo
-                )
-                if "OK" not in res.stdout:
-                    return False
-            except Exception:
-                return False
-        return True
+EXIFTOOL_NAMES = ("exiftool.exe", "exiftool")
 
-    # 탐색할 디렉토리 후보 목록 생성
-    candidate_dirs = []
-    
-    # 1. 실행 파일(exe)과 같은 디렉토리 및 상위/하위 디렉토리 (PyInstaller frozen)
+
+def _is_valid_exiftool(path_str: str) -> bool:
+    """단독형/분리형(exiftool_files) exiftool 실행 파일인지 검증한다.
+
+    분리형 배포판은 exiftool.exe 옆에 perl5xx.dll 이 든 exiftool_files 폴더가
+    있어야 동작한다. 폴더가 없으면 실제로 한 번 실행해 보고 판단한다.
+    """
+    p = Path(path_str)
+    if not p.is_file():
+        return False
+
+    has_files_dir = (p.parent / "exiftool_files").is_dir()
+
+    # 분리형인데 폴더가 없거나 단독형인데 내부 Perl DLL 손상이 의심되는 경우 자가 검증 실행
+    if p.name.lower() in EXIFTOOL_NAMES and not has_files_dir:
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            res = subprocess.run(
+                [str(p.resolve()), "-ver"],
+                capture_output=True, text=True,
+                timeout=EXIFTOOL_PROBE_TIMEOUT,
+                startupinfo=startupinfo,
+            )
+        except Exception:
+            return False
+        # -ver 은 "13.10" 같은 버전 문자열만 출력한다. 실패 시 Perl DLL 손상으로 간주.
+        if res.returncode != 0 or not res.stdout.strip():
+            return False
+    return True
+
+
+def _exiftool_candidate_dirs() -> list[Path]:
+    """exiftool 을 탐색할 디렉토리 후보를 우선순위 순으로 생성한다."""
+    dirs: list[Path] = []
+
+    def add(base: Path | None) -> None:
+        """base 및 그 하위의 관례적인 배포 폴더들을 후보에 추가."""
+        if base is None:
+            return
+        dirs.append(base)
+        for sub in ("dist", "exiftool", "ExifTool"):
+            dirs.append(base / sub)
+
+    # 1. 실행 파일(exe)과 같은 디렉토리 및 그 상위 (PyInstaller frozen)
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).parent
-        candidate_dirs.append(exe_dir)
-        candidate_dirs.append(exe_dir.parent)
-        candidate_dirs.append(exe_dir / "dist")
-        candidate_dirs.append(exe_dir.parent / "dist")
-        candidate_dirs.append(exe_dir / "ExifTool" / "dist")
-        candidate_dirs.append(exe_dir / "ExifTool")
-        
-    # 2. 스크립트 디렉토리 및 상위/하위 디렉토리
-    script_dir = Path(__file__).parent
-    candidate_dirs.append(script_dir)
-    candidate_dirs.append(script_dir / "dist")
-    candidate_dirs.append(script_dir.parent)
-    candidate_dirs.append(script_dir.parent / "dist")
+        add(exe_dir)
+        add(exe_dir.parent)
 
-    # 3. 사용자 PC 환경의 고정 디렉토리 후보군
+    # 2. 스크립트 디렉토리 및 그 상위
+    script_dir = Path(__file__).resolve().parent
+    add(script_dir)
+    add(script_dir.parent)
+
+    # 3. 현재 작업 디렉토리
     try:
-        user_home = Path.home()
-        candidate_dirs.append(user_home / "Desktop" / "ExifTool" / "dist")
-        candidate_dirs.append(user_home / "Desktop" / "ExifTool")
-        candidate_dirs.append(user_home / "Desktop")
+        add(Path.cwd())
     except Exception:
         pass
-        
-    candidate_dirs.append(Path(r"C:\Users\nuri9\Desktop\ExifTool\dist"))
-    candidate_dirs.append(Path(r"C:\Users\nuri9\Desktop\ExifTool"))
-    candidate_dirs.append(Path(r"C:\Users\nuri9\Desktop"))
-    candidate_dirs.append(Path(r"D:\ExifTool\dist"))
-    candidate_dirs.append(Path(r"D:\ExifTool"))
-    candidate_dirs.append(Path(r"G:\ExifTool"))
 
-    # 힌트 우선 처리
-    if hint:
-        if is_valid_exiftool(hint):
-            return str(Path(hint).resolve().absolute())
-        hint_path = Path(hint)
-        if hint_path.is_dir():
-            candidate_dirs.insert(0, hint_path)
+    # 4. 사용자 홈의 관례적인 위치 (바탕화면/다운로드 등, OS 무관하게 존재하면 사용)
+    try:
+        home = Path.home()
+        for folder in ("Desktop", "바탕 화면", "Downloads", "Documents"):
+            add(home / folder)
+        add(home)
+    except Exception:
+        pass
 
-    # 중복 제거 및 유효한 경로 필터링
-    unique_dirs = []
+    return dirs
+
+
+def find_exiftool(hint: str | None = None) -> str:
+    """exiftool 실행 파일 경로를 찾는다.
+
+    탐색 우선순위:
+      1) hint 인자 (파일 경로 또는 폴더 경로)
+      2) 환경 변수 EXIFTOOL_PATH (파일 경로 또는 폴더 경로)
+      3) 실행 파일/스크립트/작업 디렉토리 및 그 관례적 하위 폴더
+      4) 시스템 PATH
+    """
+    candidate_dirs: list[Path] = []
+
+    # hint 와 환경 변수를 최우선으로 처리 (파일이면 즉시 반환, 폴더면 후보 맨 앞에)
+    for raw in (hint, os.environ.get(ENV_EXIFTOOL_PATH)):
+        if not raw:
+            continue
+        raw = str(raw).strip().strip('"')
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if _is_valid_exiftool(str(candidate)):
+            return str(candidate.resolve())
+        if candidate.is_dir():
+            candidate_dirs.append(candidate)
+
+    candidate_dirs.extend(_exiftool_candidate_dirs())
+
+    # 중복 제거 및 존재하는 디렉토리만 남기기 (순서 유지)
+    unique_dirs: list[Path] = []
+    seen: set[Path] = set()
     for d in candidate_dirs:
         try:
-            resolved = d.resolve().absolute()
-            if resolved.is_dir() and resolved not in unique_dirs:
-                unique_dirs.append(resolved)
+            resolved = d.resolve()
         except Exception:
             continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.is_dir():
+            unique_dirs.append(resolved)
 
-    # 디렉토리 후보군 순회하며 exiftool 탐색
     for d in unique_dirs:
-        for name in ["exiftool.exe", "exiftool"]:
+        for name in EXIFTOOL_NAMES:
             target = d / name
-            if is_valid_exiftool(str(target)):
-                return str(target.resolve().absolute())
+            if _is_valid_exiftool(str(target)):
+                return str(target.resolve())
 
     # 마지막 보루: 시스템 PATH에서 탐색
-    for name in ["exiftool.exe", "exiftool"]:
+    for name in EXIFTOOL_NAMES:
         w = shutil.which(name)
-        if w and is_valid_exiftool(w):
-            return str(Path(w).resolve().absolute())
+        if w and _is_valid_exiftool(w):
+            return str(Path(w).resolve())
 
     raise FileNotFoundError(
-        "exiftool을 찾을 수 없습니다. ExifToolArchaeo.exe 실행 파일과 동일한 폴더에 exiftool.exe 파일을 복사해서 넣어주십시오."
+        "exiftool을 찾을 수 없습니다.\n"
+        "다음 중 한 가지 방법으로 지정해 주십시오:\n"
+        "  1) 실행 파일(ExifToolArchaeo.exe)과 같은 폴더에 exiftool.exe 를 복사\n"
+        f"  2) 환경 변수 {ENV_EXIFTOOL_PATH} 에 exiftool 경로를 설정\n"
+        "  3) --exiftool 옵션으로 경로를 직접 전달"
     )
 
 
@@ -320,7 +409,8 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
 
     results = []
     errors = []
-    
+    temp_file_path = None
+
     # 1. 임시 파일 작성 (UTF-8 인코딩)
     try:
         # 윈도우 락 우회를 위해 delete=False 적용 후 블록 내에서 수동 기록
@@ -338,24 +428,25 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
         
         # 2. ExifTool 일괄 실행 (Batch mode)
         cmd = [exiftool_path, "-json", "-charset", "filename=UTF8", "-@", temp_file_path]
-        
+
+        # 사진 수에 비례해 타임아웃을 늘린다. 수백~수천 장 배치에서 고정 30초로는
+        # 정상 동작 중에도 중간에 끊기기 때문이다.
+        timeout_s = min(
+            EXIFTOOL_TIMEOUT_MAX,
+            EXIFTOOL_TIMEOUT_BASE + EXIFTOOL_TIMEOUT_PER_IMAGE * len(image_paths),
+        )
+
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=30, # 배치 모드이므로 타임아웃을 여유 있게 설정
+            timeout=timeout_s,
             startupinfo=startupinfo,
         )
         
-        # 3. 임시 파일 즉시 삭제
-        try:
-            os.unlink(temp_file_path)
-        except Exception:
-            pass
-
-        # 4. 결과 분석
+        # 3. 결과 분석
         if result.returncode in (0, 1) and result.stdout.strip():
             try:
                 data = json.loads(result.stdout)
@@ -374,23 +465,42 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
             err_msg = result.stderr.strip() if result.stderr else f"ExitCode={result.returncode}"
             errors.append(f"ExifTool 실행 실패: {err_msg}")
             
+    except subprocess.TimeoutExpired:
+        errors.append(
+            f"ExifTool 실행 시간이 초과되었습니다 (사진 {len(image_paths)}장). "
+            "사진 수를 줄이거나 폴더를 나누어 다시 시도해 주십시오."
+        )
     except Exception as e:
-        errors.append(f"배치 실행 중 오류 발생: {str(e)}")
-        
+        errors.append(f"배치 실행 중 오류 발생: {e}")
+    finally:
+        # 예외 발생 여부와 무관하게 임시 args 파일을 반드시 정리한다.
+        if temp_file_path:
+            try:
+                os.unlink(temp_file_path)
+            except OSError:
+                pass
+
     return results, errors
 
 
-def collect_images(input_path: str) -> list[str]:
-    """Collect all supported image paths from file or directory, resolved to absolute paths."""
-    p = Path(input_path).resolve().absolute()
+def collect_images(input_path: str, recursive: bool = False) -> list[str]:
+    """파일 또는 폴더에서 지원 이미지의 절대 경로 목록을 수집한다.
+
+    확장자 비교는 대소문자를 구분하지 않으므로 .JPG/.Jpg/.jpg 를 모두 인식하며,
+    윈도우처럼 대소문자를 구분하지 않는 파일 시스템에서도 중복되지 않는다.
+    recursive=True 이면 하위 폴더까지 모두 훑는다.
+    """
+    p = Path(input_path).expanduser().resolve()
     if p.is_file():
         return [str(p)]
     if p.is_dir():
-        files = []
-        for ext in SUPPORTED_EXT:
-            files.extend(p.glob(f"*{ext}"))
-            files.extend(p.glob(f"*{ext.upper()}"))
-        return sorted(str(f.resolve().absolute()) for f in set(files))
+        it = p.rglob("*") if recursive else p.glob("*")
+        files = {
+            f.resolve()
+            for f in it
+            if f.is_file() and f.suffix.lower() in SUPPORTED_EXT
+        }
+        return sorted(str(f) for f in files)
     raise FileNotFoundError(f"입력 경로를 찾을 수 없습니다: {input_path}")
 
 
@@ -452,7 +562,7 @@ def parse_record(raw: dict) -> dict:
 
     r["Lat_DD"] = round(lat, 8) if lat is not None else None
     r["Lon_DD"] = round(lon, 8) if lon is not None else None
-    r["Alt_m"] = altitude_to_float(raw.get("GPSAltitude"))
+    r["Alt_m"] = altitude_to_float(raw.get("GPSAltitude"), raw.get("GPSAltitudeRef"))
 
     # ----------------------------------------------------------------
     # Direction / orientation
@@ -509,13 +619,14 @@ except ImportError:
     HAS_PILLOW = False
 
 
-def extract_thumbnail(source_file: str, max_size: int = 320) -> str | None:
+def extract_thumbnail(source_file: str,
+                      max_size: int = THUMB_SIZE_DEFAULT,
+                      quality: int = THUMB_QUALITY_DEFAULT) -> str | None:
     """
     Open the original photo using Windows short path name to prevent encoding issues,
     resize to thumbnail, and return base64 JPEG string.
     """
     if not HAS_PILLOW:
-        print("⚠️  Pillow 라이브러리가 로드되지 않아 썸네일을 생성할 수 없습니다. (pip install Pillow)", file=sys.stderr)
         return None
     try:
         # 한글/공백 인코딩 꼬임 방지를 위해 8.3 단축 경로명으로 변환하여 Pillow open 실행!
@@ -529,11 +640,59 @@ def extract_thumbnail(source_file: str, max_size: int = 320) -> str | None:
                 pass
             img.thumbnail((max_size, max_size), _PILImage.LANCZOS)
             buf = _io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=72)
+            img.convert("RGB").save(buf, format="JPEG", quality=quality)
             return _base64.b64encode(buf.getvalue()).decode()
     except Exception as e:
         print(f"⚠️  썸네일 추출 에러 ({source_file}): {e}", file=sys.stderr)
         return None
+
+
+def extract_thumbnails(source_files: list[str],
+                       max_size: int = THUMB_SIZE_DEFAULT,
+                       quality: int = THUMB_QUALITY_DEFAULT,
+                       progress=None) -> dict[str, str]:
+    """여러 사진의 썸네일을 병렬로 추출한다.
+
+    수백 장 규모에서 순차 처리는 지도 생성의 가장 큰 병목이므로 스레드 풀을
+    사용한다 (Pillow 의 디코딩/리사이즈는 GIL 을 놓기 때문에 실제로 빨라진다).
+
+    progress: progress(done, total) 형태의 콜백 (선택). GUI 진행률 표시용.
+    Returns: {source_file: base64_jpeg} — 실패한 파일은 결과에서 빠진다.
+    """
+    thumbs: dict[str, str] = {}
+    targets = [f for f in source_files if f]
+    total = len(targets)
+    if total == 0:
+        return thumbs
+
+    if not HAS_PILLOW:
+        print("⚠️  Pillow 라이브러리가 없어 썸네일을 생성하지 않습니다. (pip install Pillow)",
+              file=sys.stderr)
+        if progress:
+            progress(total, total)
+        return thumbs
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    workers = max(1, min(THUMB_WORKERS_MAX, (os.cpu_count() or 2), total))
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(extract_thumbnail, f, max_size, quality): f
+            for f in targets
+        }
+        for fut in as_completed(futures):
+            src = futures[fut]
+            try:
+                b64 = fut.result()
+            except Exception:
+                b64 = None
+            if b64:
+                thumbs[src] = b64
+            done += 1
+            if progress:
+                progress(done, total)
+    return thumbs
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +738,41 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
     print(f"✅ CSV 저장: {output_path}  ({len(rows)}개 레코드)")
 
 
+def write_geojson(records: list[dict], output_path: str) -> bool:
+    """GPS 가 있는 레코드를 GeoJSON(WGS84) 으로 저장한다.
+
+    QGIS·ArcGIS 에서 CSV 의 위경도 열을 수동 지정할 필요 없이 바로 열 수 있고,
+    촬영 방위각이 속성으로 들어가므로 회전 심볼(화살표) 표현에 그대로 쓸 수 있다.
+    """
+    feats = []
+    for rec in records:
+        lat, lon = rec.get("Lat_DD"), rec.get("Lon_DD")
+        if lat is None or lon is None:
+            continue
+        props = {k: v for k, v in rec.items() if k not in ("Lat_DD", "Lon_DD")}
+        feats.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": props,
+        })
+
+    if not feats:
+        print("⚠️  GeoJSON 으로 내보낼 GPS 데이터가 없습니다.", file=sys.stderr)
+        return False
+
+    out = Path(output_path)
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    # GeoJSON(RFC 7946) 은 항상 WGS84 경위도이므로 crs 멤버를 붙이지 않는다.
+    payload = {"type": "FeatureCollection", "features": feats}
+    out.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+    print(f"🌍 GeoJSON 저장: {output_path}  ({len(feats)}개 지점)")
+    return True
+
+
 
 
 
@@ -590,21 +784,39 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
 
-def write_map(records: list[dict], output_path: str):
+def write_map(records: list[dict], output_path: str,
+              thumb_size: int = THUMB_SIZE_DEFAULT,
+              thumb_quality: int = THUMB_QUALITY_DEFAULT,
+              progress=None) -> bool:
     """
     Generate a Leaflet.js HTML map with:
       - Side panel layout
       - Zoomable/Pannable photo Lightbox using mouse scroll wheel and drag
       - Clean tile layer choices including Vworld layers (Esri Satellite, OSM, Vworld layers)
-      - Nadir target icons for vertical shots (Pitch <= -85)
+      - Nadir target icons for vertical shots (Pitch <= NADIR_PITCH_THRESHOLD)
+
+    progress: progress(done, total) 콜백 (썸네일 추출 진행률, 선택)
+    Returns: 지도를 실제로 저장했으면 True, 표시할 GPS 데이터가 없으면 False
     """
+    plotted = [r for r in records
+               if r.get("Lat_DD") is not None and r.get("Lon_DD") is not None]
+    if not plotted:
+        print("⚠️  지도에 표시할 GPS 데이터가 없습니다.", file=sys.stderr)
+        return False
+
+    # 썸네일은 지도 생성의 가장 큰 병목이므로 한 번에 병렬로 추출한다.
+    # thumb_size 가 0 이하이면 썸네일을 아예 생성하지 않는다 (용량·속도 우선).
+    thumbs: dict[str, str] = {}
+    if thumb_size > 0:
+        thumbs = extract_thumbnails(
+            [r.get("SourceFile", "") for r in plotted],
+            max_size=thumb_size, quality=thumb_quality, progress=progress,
+        )
 
     features = []
-    for rec in records:
+    for rec in plotted:
         lat = rec.get("Lat_DD")
         lon = rec.get("Lon_DD")
-        if lat is None or lon is None:
-            continue
 
         yaw          = rec.get("CamDirection_deg")
         card         = rec.get("CamDirection_cardinal", "")
@@ -625,24 +837,25 @@ def write_map(records: list[dict], output_path: str):
         is_nadir = False
         if gimbal_pitch is not None:
             try:
-                if float(gimbal_pitch) <= -85.0:
+                if float(gimbal_pitch) <= NADIR_PITCH_THRESHOLD:
                     is_nadir = True
             except (ValueError, TypeError):
                 pass
 
-        # High resolution base64 thumbnail (640px)
-        thumb_b64 = extract_thumbnail(source_file, max_size=640) if source_file else None
+        thumb_b64 = thumbs.get(source_file)
 
-        alt_val = f"{alt} m" if alt is not None else "N/A"
+        alt_val = f"{alt} m" if alt not in (None, "") else "N/A"
         gp_val = f"{gimbal_pitch}°" if gimbal_pitch is not None else "N/A"
         gr_val = f"{gimbal_roll}°" if gimbal_roll is not None else "N/A"
         gy_val = f"{gimbal_yaw}°" if gimbal_yaw is not None else "N/A"
         fy_val = f"{flight_yaw}°" if flight_yaw is not None else "N/A"
 
-        popup_html = f"""
-<div style="font-family:'Segoe UI',sans-serif;font-size:0.8rem;">
-  <b>{fname}</b>
-</div>"""
+        # 파일명은 그대로 innerHTML 에 들어가므로 반드시 이스케이프한다.
+        fname_safe = html.escape(str(fname))
+        popup_html = (
+            "<div style=\"font-family:'Segoe UI',sans-serif;font-size:0.8rem;\">"
+            f"<b>{fname_safe}</b></div>"
+        )
 
         features.append({
             "lat": lat,
@@ -651,11 +864,11 @@ def write_map(records: list[dict], output_path: str):
             "has_dir": yaw is not None,
             "is_nadir": is_nadir,
             "popup": popup_html,
-            "fname": fname,
-            "dt": dt or "N/A",
+            "fname": fname_safe,
+            "dt": html.escape(str(dt)) if dt else "N/A",
             "alt": alt_val,
-            "make": make or "N/A",
-            "model": model or "N/A",
+            "make": html.escape(str(make)) if make else "N/A",
+            "model": html.escape(str(model)) if model else "N/A",
             "gimbal_yaw": gy_val,
             "gimbal_pitch": gp_val,
             "gimbal_roll": gr_val,
@@ -664,15 +877,13 @@ def write_map(records: list[dict], output_path: str):
             "thumb_b64": thumb_b64 if thumb_b64 else "",
         })
 
-    if not features:
-        print("⚠️  지도에 표시할 GPS 데이터가 없습니다.", file=sys.stderr)
-        return
-
     center_lat = sum(f["lat"] for f in features) / len(features)
     center_lon = sum(f["lon"] for f in features) / len(features)
-    features_json = json.dumps(features, ensure_ascii=False, indent=2)
+    # base64 썸네일이 포함되므로 indent 없이 최소 크기로 직렬화한다
+    # (사진 수백 장이면 들여쓰기만으로 수 MB 가 늘어난다).
+    features_json = json.dumps(features, ensure_ascii=False, separators=(",", ":"))
 
-    html = f"""<!DOCTYPE html>
+    html_doc = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
@@ -756,6 +967,25 @@ def write_map(records: list[dict], output_path: str):
       transform: scale(1.02);
     }}
     
+    .nav-bar {{
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin-bottom: 12px;
+    }}
+    .nav-btn {{
+      background: #0f3460; color: #e2e8f0; border: 1px solid #2d3748;
+      border-radius: 6px; padding: 5px 10px; font-size: 0.78rem;
+      cursor: pointer; transition: background 0.15s;
+    }}
+    .nav-btn:hover:not(:disabled) {{ background: #1a4a90; }}
+    .nav-btn:disabled {{ opacity: 0.35; cursor: default; }}
+    .nav-count {{ font-size: 0.78rem; color: #94a3b8; font-family: monospace; }}
+    .copy-btn {{
+      background: transparent; color: #94a3b8; border: 1px solid #2d3748;
+      border-radius: 4px; padding: 1px 6px; font-size: 0.68rem;
+      cursor: pointer; margin-left: 6px;
+    }}
+    .copy-btn:hover {{ color: #e94560; border-color: #e94560; }}
+
     .legend {{
       background: rgba(22, 33, 62, 0.93);
       padding: 10px 14px;
@@ -764,6 +994,9 @@ def write_map(records: list[dict], output_path: str):
       font-size: 0.76rem;
       color: #eee;
       line-height: 1.9;
+      /* 범례는 읽기 전용이므로 클릭을 통과시킨다.
+         그렇지 않으면 범례에 가린 마커를 클릭할 수 없다. */
+      pointer-events: none;
     }}
     .legend-dot {{ display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }}
     
@@ -824,7 +1057,7 @@ def write_map(records: list[dict], output_path: str):
   <div id="header">
     <span style="font-size:1.3rem;">🏛️</span>
     <h1>ExifTool Archaeo</h1>
-    <span class="sub">고고학 현장 사진 위치·방향 시각화</span>
+    <span class="sub">고고학 현장 사진 위치·방향 시각화 &nbsp;v{__version__}</span>
     <span style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
   </div>
   
@@ -835,6 +1068,12 @@ def write_map(records: list[dict], output_path: str):
         <span style="font-size: 3.5rem; display: block; margin-bottom: 15px;">📸</span>
         <b style="color: #fff; font-size: 0.95rem;">사진 상세 정보 패널</b><br>
         지도 위 화살표 마커를 클릭하시면<br>촬영 방향 정보와 사진 썸네일이<br>이곳에 상세히 연동되어 표시됩니다.
+        <div style="margin-top:18px; font-size:0.75rem; color:#718096; line-height:1.7;">
+          ⌨ <b style="color:#94a3b8;">단축키</b><br>
+          ← / → : 이전·다음 사진<br>
+          F : 전체 사진이 보이도록 맞춤<br>
+          Esc : 사진 확대창 닫기
+        </div>
       </div>
       <div id="sidebar-content" style="display: none;">
         <!-- JS 동적 렌더링 -->
@@ -845,7 +1084,7 @@ def write_map(records: list[dict], output_path: str):
   <!-- 라이트박스 구조 -->
   <div id="lightbox" onclick="closeLightbox()">
     <div class="lightbox-close" onclick="closeLightbox()">&times;</div>
-    <div class="lightbox-guide">🖱️ 휠을 굴려 확대/축소, 마우스로 드래그하여 이동할 수 있습니다.</div>
+    <div class="lightbox-guide">🖱️ 휠 = 확대/축소 · 드래그 = 이동 · 더블클릭 = 원래 크기 · Esc = 닫기</div>
     <img id="lightbox-img" src="" onclick="event.stopPropagation()">
   </div>
 
@@ -984,6 +1223,13 @@ def write_map(records: list[dict], output_path: str):
       updateTransform();
     }});
 
+    // 더블클릭 시 확대/이동 상태 초기화
+    lbImg.addEventListener('dblclick', function(e) {{
+      e.stopPropagation();
+      scale = 1; translateX = 0; translateY = 0;
+      updateTransform();
+    }});
+
     // 마우스 드래그 이벤트 (Pan)
     lbImg.addEventListener('mousedown', function(e) {{
       e.preventDefault();
@@ -1046,49 +1292,112 @@ def write_map(records: list[dict], output_path: str):
     // ── 데이터 연동 ────────────────────────────────────────────────────────
     const features = {features_json};
     const markerGroup = L.featureGroup();
+    const markers = [];
+    let currentIndex = -1;
 
-    features.forEach(f => {{
+    // 사이드바에 i번째 사진의 상세 정보를 렌더링한다.
+    function showDetail(i) {{
+      if (i < 0 || i >= features.length) return;
+      currentIndex = i;
+      const f = features[i];
+
+      document.getElementById('sidebar-placeholder').style.display = 'none';
+      const contentDiv = document.getElementById('sidebar-content');
+      contentDiv.style.display = 'block';
+
+      let imgHtml = '';
+      if (f.thumb_b64) {{
+        imgHtml = `<img class="sidebar-thumb" src="data:image/jpeg;base64,${{f.thumb_b64}}" onclick="openLightbox(this.src)" title="클릭하면 마우스 휠로 확대/축소 가능">`;
+      }} else {{
+        imgHtml = `<div style="width:100%; height:160px; background:#0f2044; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#718096; margin-bottom:15px; border: 1px dashed #2d3748; font-size:0.8rem;">썸네일 이미지 없음</div>`;
+      }}
+
+      const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
+      const coordText = `${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}`;
+
+      contentDiv.innerHTML = `
+        <div class="nav-bar">
+          <button class="nav-btn" onclick="gotoPhoto(${{i - 1}})" ${{i === 0 ? 'disabled' : ''}} title="이전 사진 (← 키)">◀ 이전</button>
+          <span class="nav-count">${{i + 1}} / ${{features.length}}</span>
+          <button class="nav-btn" onclick="gotoPhoto(${{i + 1}})" ${{i === features.length - 1 ? 'disabled' : ''}} title="다음 사진 (→ 키)">다음 ▶</button>
+        </div>
+        ${{imgHtml}}
+        <h2 style="font-size:1.15rem; font-weight:700; margin-bottom:4px; color:#e94560; word-break:break-all; line-height:1.35;">${{f.fname}}${{angleLabel}}</h2>
+        <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:15px;">🕐 촬영시각: ${{f.dt}}</div>
+        <hr style="border:none; border-top:1px solid #2d3748; margin-bottom:15px;">
+
+        <table class="sidebar-table">
+          <tr><td class="label-col">📍 위도/경도</td><td><span style="font-family:monospace; font-weight:bold; color:#fff;">${{coordText}}</span> <button class="copy-btn" onclick="copyCoord('${{coordText}}', this)" title="좌표 복사">복사</button></td></tr>
+          <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}}</td></tr>
+          <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
+          <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
+          <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
+          <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
+          <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
+        </table>
+      `;
+    }}
+
+    // 이전/다음 사진으로 이동하며 지도도 함께 따라간다.
+    function gotoPhoto(i) {{
+      if (i < 0 || i >= features.length) return;
+      showDetail(i);
+      const m = markers[i];
+      map.panTo(m.getLatLng());
+      m.openPopup();
+    }}
+
+    function copyCoord(text, btn) {{
+      const done = () => {{
+        const old = btn.textContent;
+        btn.textContent = '복사됨';
+        setTimeout(() => {{ btn.textContent = old; }}, 1200);
+      }};
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+      }} else {{
+        fallbackCopy(text, done);
+      }}
+    }}
+
+    // file:// 로 열었을 때 clipboard API 가 막히는 경우를 위한 대체 경로
+    function fallbackCopy(text, done) {{
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {{ document.execCommand('copy'); done(); }} catch (e) {{ /* 무시 */ }}
+      document.body.removeChild(ta);
+    }}
+
+    features.forEach((f, i) => {{
       const marker = L.marker([f.lat, f.lon], {{ icon: makeCustomIcon(f) }})
         .bindPopup(f.popup, {{ maxWidth: 200 }});
-      
-      // 마커 클릭 시 우측 사이드바 로드
-      marker.on('click', function() {{
-        document.getElementById('sidebar-placeholder').style.display = 'none';
-        const contentDiv = document.getElementById('sidebar-content');
-        contentDiv.style.display = 'block';
-        
-        let imgHtml = '';
-        if (f.thumb_b64) {{
-          imgHtml = `<img class="sidebar-thumb" src="data:image/jpeg;base64,${{f.thumb_b64}}" onclick="openLightbox(this.src)" title="클릭하면 마우스 휠로 확대/축소 가능">`;
-        }} else {{
-          imgHtml = `<div style="width:100%; height:160px; background:#0f2044; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#718096; margin-bottom:15px; border: 1px dashed #2d3748; font-size:0.8rem;">썸네일 이미지 없음</div>`;
-        }}
-
-        const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
-
-        contentDiv.innerHTML = `
-          ${{imgHtml}}
-          <h2 style="font-size:1.15rem; font-weight:700; margin-bottom:4px; color:#e94560; word-break:break-all; line-height:1.35;">${{f.fname}}${{angleLabel}}</h2>
-          <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:15px;">🕐 촬영시각: ${{f.dt}}</div>
-          <hr style="border:none; border-top:1px solid #2d3748; margin-bottom:15px;">
-          
-          <table class="sidebar-table">
-            <tr><td class="label-col">📍 위도/경도</td><td style="font-family:monospace; font-weight:bold; color:#fff;">${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}</td></tr>
-            <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}}</td></tr>
-            <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
-            <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
-            <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
-          </table>
-        `;
-      }});
-
+      marker.on('click', () => showDetail(i));
+      markers.push(marker);
       markerGroup.addLayer(marker);
     }});
 
     markerGroup.addTo(map);
     map.fitBounds(markerGroup.getBounds().pad(0.18));
+
+    // 축척 막대 — 현장 거리 감각을 잡는 데 필요하다.
+    L.control.scale({{ position: 'bottomright', imperial: false, maxWidth: 180 }}).addTo(map);
+
+    // ── 키보드 단축키 ──────────────────────────────────────────────────────
+    document.addEventListener('keydown', function(e) {{
+      if (e.key === 'Escape') {{
+        if (lb.style.display === 'flex') closeLightbox();
+        return;
+      }}
+      // 라이트박스가 떠 있을 때는 지도 탐색 키를 가로채지 않는다.
+      if (lb.style.display === 'flex') return;
+      if (e.key === 'ArrowLeft')  {{ e.preventDefault(); gotoPhoto(currentIndex <= 0 ? 0 : currentIndex - 1); }}
+      if (e.key === 'ArrowRight') {{ e.preventDefault(); gotoPhoto(currentIndex + 1); }}
+      if (e.key === 'f' || e.key === 'F') {{ map.fitBounds(markerGroup.getBounds().pad(0.18)); }}
+    }});
 
     // ── 범례 ─────────────────────────────────────────────────────────────
     const legend = L.control({{position:'bottomleft'}});
@@ -1098,7 +1407,7 @@ def write_map(records: list[dict], output_path: str):
         <b>범례</b><br>
         <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=바라보는 방향)<br>
         <span class="legend-dot" style="background:#718096"></span> 방향 정보 없음<br>
-        <span style="display:inline-block; width:12px; height:12px; margin-right:6px; border:2px dashed #e94560; border-radius:50%; vertical-align:middle;"></span> 수직 촬영 (Pitch 90° 부근 과녁 마커)<br>
+        <span style="display:inline-block; width:12px; height:12px; margin-right:6px; border:2px dashed #e94560; border-radius:50%; vertical-align:middle;"></span> 수직 촬영 (짐벌 Pitch {NADIR_PITCH_THRESHOLD:.0f}° 이하)<br>
         <span style="font-size:0.7rem;color:#a0aec0;">* 사이드바 사진 클릭 후 마우스 휠을 굴려 확대/축소 및 드래그 이동이 가능합니다.</span>`;
       return d;
     }};
@@ -1108,9 +1417,13 @@ def write_map(records: list[dict], output_path: str):
 </html>
 """
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"🗺️  지도 저장: {output_path}")
+    out = Path(output_path)
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html_doc, encoding="utf-8")
+    size_mb = out.stat().st_size / (1024 * 1024)
+    print(f"🗺️  지도 저장: {output_path}  ({len(features)}개 지점, {size_mb:.1f} MB)")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1158,9 +1471,9 @@ def build_parser() -> argparse.ArgumentParser:
   또는 EPSG 코드 직접 입력: epsg:5186, epsg:32652, …
         """,
     )
-    parser.add_argument("-i", "--input", required=True,
+    parser.add_argument("-i", "--input",
                         help="입력 폴더 또는 이미지 파일 경로")
-    parser.add_argument("-o", "--output", required=True,
+    parser.add_argument("-o", "--output",
                         help="출력 CSV 파일 경로 (예: output.csv)")
     parser.add_argument("--crs", default="tm",
                         help="출력 좌표계 (기본: tm = EPSG:5186 TM중부원점)")
@@ -1168,8 +1481,20 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Leaflet HTML 지도 출력 파일 경로 (선택)")
     parser.add_argument("--exiftool", default=None,
                         help="exiftool 실행 파일 경로 (미지정 시 자동 탐색)")
+    parser.add_argument("--geojson", default=None,
+                        help="GeoJSON(WGS84) 출력 파일 경로 (선택, QGIS 바로 열기용)")
+    parser.add_argument("-r", "--recursive", action="store_true",
+                        help="하위 폴더까지 재귀적으로 사진 탐색")
     parser.add_argument("--no-transform", action="store_true",
                         help="좌표 변환 없이 WGS84만 출력")
+    parser.add_argument("--thumb-size", type=int, default=THUMB_SIZE_DEFAULT,
+                        metavar="PX",
+                        help=f"지도 썸네일 최대 크기 px (기본: {THUMB_SIZE_DEFAULT}, "
+                             "0이면 썸네일 생략 → 지도 용량 대폭 감소)")
+    parser.add_argument("--list-crs", action="store_true",
+                        help="지원하는 좌표계 목록을 출력하고 종료")
+    parser.add_argument("--version", action="version",
+                        version=f"archaeo_gps {__version__}")
     return parser
 
 
@@ -1177,11 +1502,24 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    # ── 좌표계 목록만 출력하고 종료 ────────────────────────────────────────
+    if args.list_crs:
+        print("지원 좌표계 (--crs 에 사용):")
+        for key, epsg in CRS_PRESETS.items():
+            print(f"  {key:<16} {epsg}")
+        print("\n  또는 EPSG 코드 직접 입력: epsg:5186, epsg:32652, …")
+        return
+
+    if not args.input or not args.output:
+        parser.error("-i/--input 과 -o/--output 은 필수입니다. (목록만 보려면 --list-crs)")
+
     # ── 의존성 경고 ──────────────────────────────────────────────────────────
     if not HAS_PANDAS:
         print("ℹ️  pandas 미설치 → csv 모듈로 대체 출력합니다. (pip install pandas)")
     if not HAS_PYPROJ and not args.no_transform:
         print("⚠️  pyproj 미설치 → 좌표 변환이 비활성화됩니다. (pip install pyproj)")
+    if args.map and not HAS_PILLOW and args.thumb_size > 0:
+        print("⚠️  Pillow 미설치 → 지도 썸네일 없이 생성됩니다. (pip install Pillow)")
 
     # ── exiftool 탐색 ────────────────────────────────────────────────────────
     try:
@@ -1193,13 +1531,14 @@ def main():
 
     # ── 이미지 목록 ──────────────────────────────────────────────────────────
     try:
-        images = collect_images(args.input)
+        images = collect_images(args.input, recursive=args.recursive)
     except FileNotFoundError as e:
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
     if not images:
-        print(f"⚠️  지원 이미지 파일이 없습니다: {args.input}", file=sys.stderr)
+        scope = "하위 폴더 포함" if args.recursive else "하위 폴더 미포함 (-r 로 재귀 탐색)"
+        print(f"⚠️  지원 이미지 파일이 없습니다: {args.input}  [{scope}]", file=sys.stderr)
         sys.exit(1)
 
     print(f"📂 이미지 {len(images)}장 발견")
@@ -1210,7 +1549,7 @@ def main():
     if et_errors:
         for err in et_errors:
             print(f"  ⚠️ {err}", file=sys.stderr)
-            
+
     if not raw_records:
         print("❌ EXIF 데이터를 추출하지 못했습니다.", file=sys.stderr)
         sys.exit(1)
@@ -1219,38 +1558,73 @@ def main():
     gps_ok = sum(1 for r in records if r["Lat_DD"] is not None)
     dir_ok = sum(1 for r in records if r["CamDirection_deg"] is not None)
     print(f"   GPS 있음: {gps_ok}/{len(records)}장  |  방향 있음: {dir_ok}/{len(records)}장")
+    if gps_ok == 0:
+        print("⚠️  GPS 좌표가 있는 사진이 없습니다. 좌표 변환과 지도 생성은 생략됩니다.",
+              file=sys.stderr)
 
     # ── 좌표 변환 ────────────────────────────────────────────────────────────
     target_crs = ""
     transformer = None
-    if not args.no_transform and HAS_PYPROJ:
-        crs_input = args.crs.lower().strip()
-        target_crs = CRS_PRESETS.get(crs_input, crs_input)
+    crs_input = args.crs.lower().strip()
+    resolved_crs = CRS_PRESETS.get(crs_input, crs_input)
+    # wgs84 는 변환이 항등이므로 변환기를 만들지 않는다 (GUI 동작과 일치).
+    if not args.no_transform and HAS_PYPROJ and resolved_crs != CRS_PRESETS["wgs84"]:
+        target_crs = resolved_crs
         transformer = build_transformers(target_crs)
         if transformer:
             print(f"🌐 좌표 변환: WGS84 → {target_crs}")
+        else:
+            target_crs = ""
 
     # ── CSV 출력 ─────────────────────────────────────────────────────────────
     output_dir = Path(args.output).parent
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if str(output_dir):
+        output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(records, args.output, transformer=transformer, target_crs=target_crs)
+
+    # ── GeoJSON 출력 ─────────────────────────────────────────────────────────
+    if args.geojson:
+        write_geojson(records, args.geojson)
 
     # ── HTML 지도 ────────────────────────────────────────────────────────────
     if args.map:
-        write_map(records, args.map)
+        thumb_size = max(0, args.thumb_size)
+        write_map(records, args.map,
+                  thumb_size=thumb_size if thumb_size > 0 else 0,
+                  progress=_cli_thumb_progress if thumb_size > 0 else None)
 
     # ── 요약 출력 ────────────────────────────────────────────────────────────
+    _print_summary(records)
+
+
+def _cli_thumb_progress(done: int, total: int) -> None:
+    """CLI 에서 썸네일 추출 진행률을 한 줄로 갱신 표시한다."""
+    if total <= 0:
+        return
+    pct = done * 100 // total
+    end = "\n" if done >= total else ""
+    print(f"\r🖼️  썸네일 생성 중… {done}/{total} ({pct}%)", end=end, flush=True)
+
+
+def _print_summary(records: list[dict]) -> None:
+    """추출 결과 요약 표를 출력한다."""
+    # 파일명 열 너비를 실제 데이터에 맞춰 잡는다 (긴 드론 파일명이 잘리지 않도록).
+    name_w = max([len(str(r.get("FileName", ""))) for r in records] + [8])
+    name_w = min(name_w, 40)
+    line = "─" * (name_w + 45)
+
     print()
-    print("─" * 50)
-    print(f"{'파일명':<20} {'방향(°)':<10} {'방향':<6} {'위도':>12} {'경도':>13}")
-    print("─" * 50)
+    print(line)
+    print(f"{'파일명':<{name_w}} {'방향(°)':>8} {'방위':>5} {'위도':>12} {'경도':>13}")
+    print(line)
     for r in records:
         lat_s = f"{r['Lat_DD']:.6f}" if r["Lat_DD"] is not None else "N/A"
         lon_s = f"{r['Lon_DD']:.6f}" if r["Lon_DD"] is not None else "N/A"
         dir_s = f"{r['CamDirection_deg']:.1f}" if r["CamDirection_deg"] is not None else "N/A"
-        card  = r.get("CamDirection_cardinal", "")
-        print(f"{r['FileName']:<20} {dir_s:<10} {card:<6} {lat_s:>12} {lon_s:>13}")
-    print("─" * 50)
+        card = r.get("CamDirection_cardinal", "") or "-"
+        name = str(r.get("FileName", ""))[:name_w]
+        print(f"{name:<{name_w}} {dir_s:>8} {card:>5} {lat_s:>12} {lon_s:>13}")
+    print(line)
 
 
 if __name__ == "__main__":

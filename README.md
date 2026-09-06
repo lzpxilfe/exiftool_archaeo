@@ -15,7 +15,10 @@
     *   **실시간 base64 썸네일 팝업**: 외부 이미지 서버가 없어도 개별 마커와 정보창 내부의 썸네일 이미지를 클릭해 바로 볼 수 있습니다.
     *   **🔍 라이트박스 휠 줌 & 드래그**: 팝업된 사진을 **마우스 휠 스크롤로 자유롭게 확대/축소**하고 **드래그로 이동**하며 정밀 유구를 판독할 수 있습니다.
     *   **🎯 Nadir(수직 촬영) 과녁 마커**: 짐벌이 수직 아래(`Gimbal Pitch <= -85°`)를 향한 사진은 과녁 모양 점선 마커로 시각화해 줍니다.
+    *   **⌨️ 키보드 단축키**: `←` / `→` 로 사진을 순서대로 넘겨보고, `F` 로 전체 지점이 보이도록 맞추며, `Esc` 로 확대창을 닫습니다. 사이드바에서 좌표를 클릭 한 번으로 복사할 수 있고, 축척 막대로 현장 거리를 가늠할 수 있습니다.
 *   **📡 국가지리정보 호환 좌표계(TM) 변환**: GPS 위경도(WGS84) 데이터를 QGIS 등 문화재 분포도 지형도에 즉시 중첩할 수 있도록 한국 공식 투영계(`TM중부원점`, `UTM-K`, `구 Bessel 원점` 등)로 정밀 변환해 CSV로 저장합니다.
+*   **🌍 GeoJSON 내보내기**: `--geojson` 옵션(또는 GUI 체크박스)으로 QGIS·ArcGIS에서 위경도 열을 수동 지정할 필요 없이 바로 열리는 GeoJSON을 함께 저장합니다. 촬영 방위각이 속성으로 들어가 회전 심볼(화살표) 표현에 그대로 쓸 수 있습니다.
+*   **🗂 하위 폴더 재귀 탐색**: 비행 아키(sortie)별로 나뉜 폴더 구조도 `-r` 옵션 한 번으로 한꺼번에 처리합니다.
 
 ---
 
@@ -64,6 +67,12 @@ pyinstaller archaeo_gps.spec --clean
   └── exiftool_files/       # 👈 ExifTool 라이브러리 폴더 (perl5*.dll 등 포함)
 ```
 > 💡 **Tip**: `ExifToolArchaeo.exe`는 실행 시 자신의 CWD(작업 디렉토리) 및 같은 경로 상에 유효한 `exiftool.exe` 세트가 존재하는지 자가 검증을 진행하므로, 반드시 한 폴더에 함께 묶어 보관하십시오.
+>
+> 📌 **exiftool을 다른 곳에 두고 싶다면**: 환경 변수 **`EXIFTOOL_PATH`** 에 `exiftool.exe` 파일 경로(또는 그 파일이 든 폴더 경로)를 지정하면 됩니다. CLI에서는 `--exiftool` 옵션으로도 직접 전달할 수 있습니다.
+> ```bash
+> set EXIFTOOL_PATH=D:\tools\exiftool\exiftool.exe   # Windows
+> export EXIFTOOL_PATH=/usr/local/bin/exiftool          # macOS / Linux
+> ```
 
 ---
 
@@ -109,6 +118,39 @@ ExifToolArchaeo.exe -i D:\지표조사\드론사진 -o D:\지표조사\결과.cs
 
 # 투영 좌표계 적용 및 HTML 지도 함께 내보내기
 ExifToolArchaeo.exe -i D:\지표조사\드론사진 -o D:\결과.csv --crs tm --map D:\현장위치도.html
+
+# 하위 폴더까지 모두 훑고 QGIS용 GeoJSON도 함께 저장
+ExifToolArchaeo.exe -i D:\지표조사 -o D:\결과.csv -r --geojson D:\결과.geojson
+
+# 사진이 아주 많을 때: 썸네일을 빼서 지도 파일 용량을 크게 줄임
+ExifToolArchaeo.exe -i D:\지표조사\드론사진 -o D:\결과.csv --map D:\지도.html --thumb-size 0
+```
+
+#### 주요 옵션
+
+| 옵션 | 설명 |
+| :--- | :--- |
+| `-i`, `--input` | 입력 폴더 또는 이미지 파일 경로 |
+| `-o`, `--output` | 출력 CSV 경로 |
+| `-r`, `--recursive` | 하위 폴더까지 재귀 탐색 |
+| `--crs` | 출력 좌표계 (기본 `tm` = EPSG:5186) |
+| `--map` | Leaflet HTML 지도 출력 경로 |
+| `--geojson` | GeoJSON(WGS84) 출력 경로 |
+| `--thumb-size PX` | 지도 썸네일 최대 크기 (기본 640, `0`이면 썸네일 생략) |
+| `--exiftool` | exiftool 실행 파일 경로 직접 지정 |
+| `--no-transform` | 좌표 변환 없이 WGS84만 출력 |
+| `--list-crs` | 지원 좌표계 목록 출력 후 종료 |
+| `--version` | 버전 출력 |
+
+---
+
+## 🧪 테스트 (개발자용)
+
+커스텀 파싱 로직(좌표 변환, 방위각 계산, 파일 수집, 출력 포맷)에 대한 단위 테스트가 포함되어 있습니다.
+ExifTool 실행 파일이나 실제 사진 없이도 동작합니다:
+
+```bash
+python -m unittest test_archaeo_gps -v
 ```
 
 ---
