@@ -17,9 +17,18 @@ class TestDmsToDd(unittest.TestCase):
     def test_decimal_passthrough(self):
         self.assertAlmostEqual(ag.dms_to_dd("36.371791666"), 36.371791666)
 
-    def test_dms_with_hemisphere(self):
-        self.assertAlmostEqual(ag.dms_to_dd("36 deg 22' 14.45\" N"),
-                               36 + 22 / 60 + 14.45 / 3600, places=8)
+    def test_decimal_with_hemisphere(self):
+        self.assertAlmostEqual(ag.dms_to_dd("36.371791666 S"), -36.371791666)
+        self.assertAlmostEqual(ag.dms_to_dd("127.361234° W"), -127.361234)
+
+    def test_dms_with_hemisphere_and_rtk_precision(self):
+        # 6-decimal seconds (~0.03mm precision) must be preserved
+        self.assertAlmostEqual(ag.dms_to_dd("36 deg 22' 14.451234\" N"),
+                               36 + 22 / 60 + 14.451234 / 3600, places=8)
+
+    def test_signed_dms(self):
+        self.assertAlmostEqual(ag.dms_to_dd("-33 deg 52' 07.68\""),
+                               -(33 + 52 / 60 + 7.68 / 3600), places=8)
 
     def test_southern_hemisphere_is_negative(self):
         self.assertLess(ag.dms_to_dd("36 deg 22' 14.45\" S"), 0)
@@ -29,6 +38,7 @@ class TestDmsToDd(unittest.TestCase):
 
     def test_none_and_garbage(self):
         self.assertIsNone(ag.dms_to_dd(None))
+        self.assertIsNone(ag.dms_to_dd(""))
         self.assertIsNone(ag.dms_to_dd("not a coordinate"))
 
 
@@ -82,22 +92,37 @@ class TestParseRecord(unittest.TestCase):
         })
         self.assertEqual(rec["CamDirection_deg"], 315.0)
         self.assertEqual(rec["CamDirection_cardinal"], "NW")
+        self.assertEqual(rec["CameraType"], ag.CAMERA_TYPE_DRONE)
 
     def test_falls_back_to_gps_direction(self):
-        rec = ag.parse_record({"FileName": "a.JPG", "GPSImgDirection": "90"})
+        rec = ag.parse_record({"FileName": "a.JPG", "Make": "Canon", "GPSImgDirection": "90"})
         self.assertEqual(rec["CamDirection_deg"], 90.0)
+        self.assertEqual(rec["CameraType"], ag.CAMERA_TYPE_DSLR)
 
     def test_missing_gps_is_none(self):
         rec = ag.parse_record({"FileName": "a.JPG"})
         self.assertIsNone(rec["Lat_DD"])
         self.assertIsNone(rec["CamDirection_deg"])
 
-    def test_hemisphere_ref_applied(self):
-        rec = ag.parse_record({"FileName": "a.JPG", "GPSLatitude": "36.5",
-                               "GPSLatitudeRef": "S", "GPSLongitude": "127.5",
-                               "GPSLongitudeRef": "W"})
-        self.assertLess(rec["Lat_DD"], 0)
-        self.assertLess(rec["Lon_DD"], 0)
+    def test_hemisphere_ref_applied_short_and_full_word(self):
+        # "S"/"W" 뿐 아니라 ExifTool 기본 문자열인 "South"/"West" 도 음수로 처리되어야 한다
+        for lat_ref, lon_ref in [("S", "W"), ("South", "West")]:
+            rec = ag.parse_record({
+                "FileName": "a.JPG",
+                "GPSLatitude": "36.5", "GPSLatitudeRef": lat_ref,
+                "GPSLongitude": "127.5", "GPSLongitudeRef": lon_ref,
+            })
+            self.assertLess(rec["Lat_DD"], 0, f"failed for {lat_ref}")
+            self.assertLess(rec["Lon_DD"], 0, f"failed for {lon_ref}")
+
+    def test_explicit_camera_type_and_folder_override(self):
+        rec = ag.parse_record(
+            {"FileName": "IMG_01.JPG", "GimbalYawDegree": "10"},
+            camera_type=ag.CAMERA_TYPE_DSLR,
+            folder_label="트렌치1",
+        )
+        self.assertEqual(rec["CameraType"], ag.CAMERA_TYPE_DSLR)
+        self.assertEqual(rec["Folder"], "트렌치1")
 
 
 class TestCollectImages(unittest.TestCase):
@@ -116,6 +141,32 @@ class TestCollectImages(unittest.TestCase):
             deep = ag.collect_images(str(root), recursive=True)
             self.assertEqual(len(deep), 4)
             self.assertTrue(any("deep.jpg" in f for f in deep))
+
+    def test_collect_grouped_images_drone_and_dslr(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            drone_dir = root / "드론_A구역"
+            dslr_dir = root / "DSLR_유구1"
+            (drone_dir / "1차비행").mkdir(parents=True)
+            dslr_dir.mkdir(parents=True)
+
+            f_drone = drone_dir / "1차비행" / "DJI_001.JPG"
+            f_dslr = dslr_dir / "IMG_001.JPG"
+            f_drone.touch()
+            f_dslr.touch()
+
+            paths, meta = ag.collect_grouped_images(
+                drone_inputs=[str(drone_dir)],
+                dslr_inputs=[str(dslr_dir)],
+                recursive=True,
+            )
+            self.assertEqual(len(paths), 2)
+            m_drone = meta[str(f_drone.resolve())]
+            m_dslr = meta[str(f_dslr.resolve())]
+            self.assertEqual(m_drone["camera_type"], ag.CAMERA_TYPE_DRONE)
+            self.assertEqual(m_drone["folder"], "드론_A구역/1차비행")
+            self.assertEqual(m_dslr["camera_type"], ag.CAMERA_TYPE_DSLR)
+            self.assertEqual(m_dslr["folder"], "DSLR_유구1")
 
     def test_single_file(self):
         with tempfile.TemporaryDirectory() as d:
@@ -147,6 +198,11 @@ class TestFindExiftool(unittest.TestCase):
                 else:
                     os.environ[ag.ENV_EXIFTOOL_PATH] = old
 
+    def test_untrusted_downloads_dir_not_in_candidates(self):
+        cand_names = {p.name for p in ag._exiftool_candidate_dirs()}
+        self.assertNotIn("Downloads", cand_names)
+        self.assertNotIn("Desktop", cand_names)
+
     def test_no_personal_paths_hardcoded(self):
         # 특정 PC 의 사용자 폴더가 소스에 남아 있으면 안 된다
         src = Path(ag.__file__).read_text(encoding="utf-8")
@@ -155,14 +211,26 @@ class TestFindExiftool(unittest.TestCase):
 
 
 class TestOutputs(unittest.TestCase):
-    SAMPLE = [{
-        "FileName": "DJI_0001.JPG", "SourceFile": "/tmp/DJI_0001.JPG",
-        "DateTime": "2026:01:01 10:00:00", "Make": "DJI", "Model": "M3E",
-        "Lat_DD": 36.371791, "Lon_DD": 127.123456, "Alt_m": 525.2,
-        "CamDirection_deg": 135.0, "CamDirection_cardinal": "SE",
-        "GimbalPitch": -30.0, "GimbalYaw": 135.0, "GimbalRoll": 0.0,
-        "FlightYaw": 130.0,
-    }]
+    SAMPLE = [
+        {
+            "FileName": "DJI_0001.JPG", "SourceFile": "/tmp/drone1/DJI_0001.JPG",
+            "CameraType": "drone", "Folder": "드론1구역",
+            "DateTime": "2026:01:01 10:00:00", "Make": "DJI", "Model": "M3E",
+            "Lat_DD": 36.371791, "Lon_DD": 127.123456, "Alt_m": 525.2,
+            "CamDirection_deg": 135.0, "CamDirection_cardinal": "SE",
+            "GimbalPitch": -30.0, "GimbalYaw": 135.0, "GimbalRoll": 0.0,
+            "FlightYaw": 130.0,
+        },
+        {
+            "FileName": "DSC_0002.JPG", "SourceFile": "/tmp/dslr1/DSC_0002.JPG",
+            "CameraType": "dslr", "Folder": "DSLR_유구A",
+            "DateTime": "2026:01:01 10:05:00", "Make": "Nikon", "Model": "Z8",
+            "Lat_DD": 36.371850, "Lon_DD": 127.123500, "Alt_m": 45.0,
+            "CamDirection_deg": 90.0, "CamDirection_cardinal": "E",
+            "GimbalPitch": None, "GimbalYaw": None, "GimbalRoll": None,
+            "FlightYaw": None,
+        },
+    ]
 
     def test_geojson_structure(self):
         with tempfile.TemporaryDirectory() as d:
@@ -180,15 +248,27 @@ class TestOutputs(unittest.TestCase):
             self.assertFalse(ag.write_geojson([{"FileName": "x", "Lat_DD": None,
                                                 "Lon_DD": None}], str(out)))
 
-    def test_map_escapes_filenames(self):
+    def test_map_escapes_filenames_and_separates_drone_dslr_arrows(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "m.html"
-            recs = [dict(self.SAMPLE[0], FileName="<script>alert(1)</script>.jpg",
-                         SourceFile="")]
+            recs = [
+                dict(self.SAMPLE[0], FileName="<script>alert(1)</script>.jpg", SourceFile=""),
+                dict(self.SAMPLE[1], SourceFile=""),
+            ]
             self.assertTrue(ag.write_map(recs, str(out), thumb_size=0))
-            html = out.read_text(encoding="utf-8")
-            self.assertNotIn("<script>alert(1)</script>.jpg", html)
-            self.assertIn("&lt;script&gt;", html)
+            html_str = out.read_text(encoding="utf-8")
+            self.assertNotIn("<script>alert(1)</script>.jpg", html_str)
+            self.assertIn("&lt;script&gt;", html_str)
+            # 드론은 has_dir=true (화살표 표시), DSLR은 방향값이 있어도 has_dir=false (점만 표시)
+            self.assertIn('"cam_type":"drone"', html_str)
+            self.assertIn('"cam_type":"dslr"', html_str)
+            self.assertIn('"has_dir":true', html_str)
+            self.assertIn('"has_dir":false', html_str)
+            # 밀집 마커 가림 방지 슬라이더 및 독립 타일 레이어 포함 확인
+            self.assertIn("scale-slider", html_str)
+            self.assertIn("opacity-slider", html_str)
+            self.assertIn("vworldHybridOverlay", html_str)
+            self.assertIn("cartoLabelsOverlay", html_str)
 
     def test_map_returns_false_without_gps(self):
         with tempfile.TemporaryDirectory() as d:
@@ -197,13 +277,17 @@ class TestOutputs(unittest.TestCase):
                                             "Lon_DD": None}], str(out)))
             self.assertFalse(out.exists())
 
-    def test_csv_written_without_pandas_path(self):
+    def test_csv_written_with_camera_type_and_folder(self):
         with tempfile.TemporaryDirectory() as d:
             out = Path(d) / "out.csv"
             ag.write_csv(self.SAMPLE, str(out))
             text = out.read_text(encoding="utf-8-sig")
             self.assertIn("DJI_0001.JPG", text)
-            self.assertIn("FileName", text.splitlines()[0])
+            self.assertIn("드론1구역", text)
+            self.assertIn("DSLR_유구A", text)
+            header = text.splitlines()[0]
+            self.assertIn("CameraType", header)
+            self.assertIn("Folder", header)
 
 
 class TestCrsPresets(unittest.TestCase):

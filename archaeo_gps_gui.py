@@ -38,10 +38,18 @@ if hasattr(sys, "_MEIPASS"):
     sys.path.insert(0, sys._MEIPASS)
 
 from archaeo_gps import (
-    find_exiftool, collect_images, run_exiftool, parse_record,
+    find_exiftool, collect_images, collect_grouped_images, run_exiftool, parse_record,
     write_csv, write_map, write_geojson, build_transformers, CRS_PRESETS,
-    HAS_PANDAS, HAS_PYPROJ, HAS_PILLOW, THUMB_SIZE_DEFAULT, __version__,
+    CAMERA_TYPE_DRONE, CAMERA_TYPE_DSLR, MAX_SUMMARY_ROWS,
+    HAS_PYPROJ, HAS_PILLOW, THUMB_SIZE_DEFAULT, __version__,
 )
+
+
+def _split_folder_inputs(raw_str: str) -> list[str]:
+    """세미콜론(;)으로 구분된 하나 이상의 폴더/파일 경로 문자열을 리스트로 분리한다."""
+    if not raw_str:
+        return []
+    return [part.strip() for part in str(raw_str).split(";") if part.strip()]
 
 
 # ── 사용자 설정 저장 (마지막 사용 값 기억) ──────────────────────────────────
@@ -117,11 +125,11 @@ def run_gui():
     settings = load_settings()
 
     root = tk.Tk()
-    root.withdraw() # 메인 화면 임시 숨김 (스플래시 표시용)
+    root.withdraw()  # 메인 화면 임시 숨김 (스플래시 표시용)
     root.title("ExifTool Archaeo — 고고학 현장 GPS 추출기")
     root.configure(bg=BG)
     root.resizable(True, True)
-    root.minsize(700, 580)
+    root.minsize(740, 620)
 
     # ── 스플래시 로딩 화면 ───────────────────────────────────────────────────
     splash = tk.Toplevel(root)
@@ -243,28 +251,38 @@ def run_gui():
         f.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         f.columnconfigure(1, weight=1)
         tk.Label(f, text=title, font=FONT_BOLD,
-                 bg=PANEL, fg=ACCENT).grid(row=0, column=0, columnspan=3,
+                 bg=PANEL, fg=ACCENT).grid(row=0, column=0, columnspan=4,
                                             sticky="w", pady=(0, 8))
         return f
 
-    def make_row(parent, label, row, browse_fn=None, browse_text="폴더 선택"):
+    def make_row(parent, label, row, browse_fn=None, browse_text="폴더 선택",
+                 add_fn=None, clear_fn=None):
         ttk.Label(parent, text=label, style="Panel.TLabel").grid(
             row=row, column=0, sticky="w", padx=(0, 10))
         var = tk.StringVar()
-        entry = ttk.Entry(parent, textvariable=var, width=50)
+        entry = ttk.Entry(parent, textvariable=var, width=46)
         entry.grid(row=row, column=1, sticky="ew", pady=2)
+        btn_box = ttk.Frame(parent, style="Panel.TFrame")
+        btn_box.grid(row=row, column=2, padx=(6, 0), sticky="e")
         if browse_fn:
-            ttk.Button(parent, text=browse_text, style="Browse.TButton",
-                       command=lambda: var.set(browse_fn())).grid(
-                       row=row, column=2, padx=(6, 0))
+            ttk.Button(btn_box, text=browse_text, style="Browse.TButton",
+                       command=lambda: var.set(browse_fn(var.get()))).pack(side="left", padx=(0, 3))
+        if add_fn:
+            ttk.Button(btn_box, text="+추가", style="Browse.TButton",
+                       command=lambda: var.set(add_fn(var.get()))).pack(side="left", padx=(0, 3))
+        if clear_fn:
+            ttk.Button(btn_box, text="비우기", style="Browse.TButton",
+                       command=lambda: var.set("")).pack(side="left")
         return var
 
-    # § 섹션 1 — 입력 / 출력
-    sec1 = make_section(body, "📂  입력 / 출력", 0)
+    # § 섹션 1 — 입력 / 출력 (드론 폴더와 DSLR 폴더 분리)
+    sec1 = make_section(body, "📂  입력 / 출력 (드론 · DSLR 분리 입력 지원)", 0)
 
     def _initial_dir(current: str) -> str:
         """대화상자가 마지막으로 쓰던 폴더에서 열리도록 시작 경로를 고른다."""
-        for cand in (current, settings.get("last_dir", "")):
+        parts = _split_folder_inputs(current)
+        first_cand = parts[-1] if parts else current
+        for cand in (first_cand, settings.get("last_dir", "")):
             if cand:
                 p = Path(cand)
                 p = p if p.is_dir() else p.parent
@@ -277,14 +295,24 @@ def run_gui():
             p = Path(path)
             settings["last_dir"] = str(p if p.is_dir() else p.parent)
 
-    def browse_input():
-        d = filedialog.askdirectory(title="사진 폴더 선택",
-                                    initialdir=_initial_dir(v_input.get()) or None)
+    def _browse_folder(title_str: str, current_val: str) -> str:
+        d = filedialog.askdirectory(title=title_str,
+                                    initialdir=_initial_dir(current_val) or None)
         _remember_dir(d)
-        # 취소 시 기존 값을 지우지 않는다.
-        return d or v_input.get()
+        return d or current_val
 
-    def browse_output():
+    def _add_folder(title_str: str, current_val: str) -> str:
+        d = filedialog.askdirectory(title=title_str,
+                                    initialdir=_initial_dir(current_val) or None)
+        _remember_dir(d)
+        if not d:
+            return current_val
+        existing = _split_folder_inputs(current_val)
+        if d not in existing:
+            existing.append(d)
+        return "; ".join(existing)
+
+    def browse_output(_cur: str = ""):
         f = filedialog.asksaveasfilename(
             title="CSV 저장 위치", defaultextension=".csv",
             initialdir=_initial_dir(v_output.get()) or None,
@@ -295,14 +323,36 @@ def run_gui():
     def browse_map():
         f = filedialog.asksaveasfilename(
             title="지도 HTML 저장 위치", defaultextension=".html",
-            initialdir=_initial_dir(v_map_path.get()) or None,
+            initialdir=_initial_dir(v_map_path.get() or v_output.get()) or None,
             filetypes=[("HTML 파일", "*.html"), ("모든 파일", "*.*")])
         _remember_dir(f)
         return f or v_map_path.get()
 
-    v_input  = make_row(sec1, "사진 폴더", 1, browse_input, "폴더 선택")
-    v_output = make_row(sec1, "출력 CSV",  2, browse_output, "저장 위치")
-    v_input.set(settings.get("input", ""))
+    v_drone_input = make_row(
+        sec1, "드론 사진 폴더 (화살표)", 1,
+        browse_fn=lambda cur: _browse_folder("드론 사진 폴더 선택", cur),
+        browse_text="폴더 선택",
+        add_fn=lambda cur: _add_folder("드론 사진 폴더 추가", cur),
+        clear_fn=True,
+    )
+    v_dslr_input = make_row(
+        sec1, "DSLR 사진 폴더 (점만)", 2,
+        browse_fn=lambda cur: _browse_folder("DSLR 사진 폴더 선택", cur),
+        browse_text="폴더 선택",
+        add_fn=lambda cur: _add_folder("DSLR 사진 폴더 추가", cur),
+        clear_fn=True,
+    )
+    tk.Label(
+        sec1,
+        text="💡 드론 폴더는 점+촬영방향 화살표로, DSLR 폴더는 화살표 없이 점으로 표시됩니다. 폴더별로 색상이 자동 구분됩니다.",
+        font=("Segoe UI", 8), bg=PANEL, fg=SUBTEXT,
+    ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(2, 6))
+
+    v_output = make_row(sec1, "출력 CSV", 4, browse_output, "저장 위치")
+
+    # 이전 버전 설정("input")이 있으면 드론 입력칸에 하위호환 복원
+    v_drone_input.set(settings.get("drone_input", settings.get("input", "")))
+    v_dslr_input.set(settings.get("dslr_input", ""))
     v_output.set(settings.get("output", ""))
 
     # § 섹션 2 — 설정
@@ -355,11 +405,11 @@ def run_gui():
     map_frame.columnconfigure(1, weight=1)
 
     v_make_map = tk.BooleanVar(value=settings.get("make_map", True))
-    ttk.Checkbutton(map_frame, text="HTML 지도 생성 (Leaflet)",
+    ttk.Checkbutton(map_frame, text="HTML 지도 생성 (비워두면 CSV와 같은 이름으로 저장)",
                     variable=v_make_map,
                     style="TCheckbutton").grid(row=0, column=0, sticky="w")
     v_map_path = tk.StringVar(value=settings.get("map_path", ""))
-    ttk.Entry(map_frame, textvariable=v_map_path, width=32).grid(
+    ttk.Entry(map_frame, textvariable=v_map_path, width=28).grid(
         row=0, column=1, sticky="ew", padx=(8, 4))
     ttk.Button(map_frame, text="저장 위치", style="Browse.TButton",
                command=lambda: v_map_path.set(browse_map())).grid(
@@ -372,7 +422,7 @@ def run_gui():
     opt_frame.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(8, 0))
 
     v_recursive = tk.BooleanVar(value=settings.get("recursive", False))
-    ttk.Checkbutton(opt_frame, text="하위 폴더까지 모두 검색",
+    ttk.Checkbutton(opt_frame, text="하위 폴더까지 모두 검색 (하위 폴더별 색상 구분)",
                     variable=v_recursive, style="TCheckbutton").grid(
                     row=0, column=0, sticky="w", padx=(0, 16))
 
@@ -392,8 +442,6 @@ def run_gui():
                             text="지도에 사진 썸네일 포함 (Pillow 미설치)")
 
     # ExifTool 경로는 백그라운드에서 자동 탐색하므로 UI에서 제외
-    # (탐색 시 exiftool 을 실제로 실행해 보므로 느릴 수 있어 별도 스레드에서 수행한다.
-    #  메인 스레드에서 돌리면 창이 뜨기 전에 몇 초씩 멈춘 것처럼 보인다.)
     v_exiftool = tk.StringVar()
 
     def _detect_exiftool_async():
@@ -401,7 +449,10 @@ def run_gui():
             found = find_exiftool(None)
         except FileNotFoundError:
             found = ""
-        root.after(0, lambda: v_exiftool.set(found))
+        try:
+            root.after(0, lambda: v_exiftool.set(found))
+        except Exception:
+            pass
 
     threading.Thread(target=_detect_exiftool_async, daemon=True).start()
 
@@ -449,7 +500,12 @@ def run_gui():
                 log_text.configure(state="disabled")
         except queue.Empty:
             pass
-        root.after(100, drain_queue)
+        except tk.TclError:
+            return
+        try:
+            root.after(100, drain_queue)
+        except tk.TclError:
+            return
 
     root.after(100, drain_queue)
 
@@ -460,29 +516,36 @@ def run_gui():
 
     def set_progress(value: float):
         """진행률 갱신 — Tk 변수는 반드시 메인 스레드에서 건드려야 한다."""
-        root.after(0, lambda: progress_var.set(value))
+        try:
+            root.after(0, lambda: progress_var.set(value))
+        except Exception:
+            pass
 
     def start_run():
-        # 입력 검증
-        inp = v_input.get().strip()
+        # 입력 검증 (드론 폴더, DSLR 폴더 중 최소 1개 이상)
+        drone_raw = v_drone_input.get().strip()
+        dslr_raw = v_dslr_input.get().strip()
+        drone_list = _split_folder_inputs(drone_raw)
+        dslr_list = _split_folder_inputs(dslr_raw)
         out = v_output.get().strip()
-        if not inp:
-            messagebox.showwarning("입력 오류", "사진 폴더를 선택해 주세요.")
+
+        if not drone_list and not dslr_list:
+            messagebox.showwarning("입력 오류", "드론 사진 폴더 또는 DSLR 사진 폴더를 하나 이상 선택해 주세요.")
             return
-        if not Path(inp).exists():
-            messagebox.showwarning("입력 오류", f"사진 폴더를 찾을 수 없습니다:\n{inp}")
-            return
+        for p in drone_list + dslr_list:
+            if not Path(p).exists():
+                messagebox.showwarning("입력 오류", f"입력 경로를 찾을 수 없습니다:\n{p}")
+                return
         if not out:
             messagebox.showwarning("입력 오류", "출력 CSV 저장 위치를 선택해 주세요.")
             return
 
-        # 지도 경로 자동 설정
+        # 지도 경로: 입력칸이 비어 있으면 현재 CSV 경로 기준으로 자동 파생하되,
+        # 입력칸(v_map_path) 자체는 덮어쓰지 않아 다음번 CSV 경로 변경 시에도 자동 추적되게 한다.
         map_path = ""
+        user_map_path = v_map_path.get().strip()
         if v_make_map.get():
-            map_path = v_map_path.get().strip()
-            if not map_path:
-                map_path = str(Path(out).with_suffix(".html"))
-                v_map_path.set(map_path)
+            map_path = user_map_path or str(Path(out).with_suffix(".html"))
 
         geojson_path = ""
         if v_geojson.get():
@@ -496,20 +559,18 @@ def run_gui():
         crs_code = next((c[1] for c in CRS_OPTIONS if c[0] == crs_label), "tm")
         target_crs = CRS_PRESETS.get(crs_code, crs_code)
 
-        # ExifTool 감지 여부 실시간 확인 및 안내
-        try:
-            find_exiftool(v_exiftool.get().strip() or None)
-        except FileNotFoundError as e:
-            messagebox.showerror("ExifTool 누락", str(e))
-            return
-
         et_path_hint = v_exiftool.get().strip() or None
 
         # 다음 실행을 위해 현재 설정을 저장한다.
         settings.update({
-            "input": inp, "output": out, "crs": crs_code,
-            "make_map": v_make_map.get(), "map_path": v_map_path.get().strip(),
-            "recursive": recursive, "geojson": v_geojson.get(),
+            "drone_input": drone_raw,
+            "dslr_input": dslr_raw,
+            "output": out,
+            "crs": crs_code,
+            "make_map": v_make_map.get(),
+            "map_path": user_map_path,
+            "recursive": recursive,
+            "geojson": v_geojson.get(),
             "thumbs": v_thumbs.get(),
         })
         save_settings(settings)
@@ -522,29 +583,34 @@ def run_gui():
 
         def worker():
             try:
-                # 1. exiftool 탐색
+                # 1. exiftool 탐색 (워커 스레드에서 수행하여 메인 UI 블로킹 방지)
                 log("▶ ExifTool 탐색 중…", "info")
                 try:
                     et = find_exiftool(et_path_hint)
                     log(f"✔ ExifTool: {et}", "ok")
                 except FileNotFoundError as e:
                     log(f"✘ {e}", "err")
+                    root.after(0, lambda msg=str(e): messagebox.showerror("ExifTool 누락", msg))
                     return
 
-                # 2. 이미지 목록
+                # 2. 이미지 목록 (드론 / DSLR 구분 수집)
                 scope = "하위 폴더 포함" if recursive else "선택 폴더만"
                 log(f"▶ 이미지 목록 수집 중… ({scope})", "info")
                 try:
-                    images = collect_images(inp, recursive=recursive)
+                    images, meta_by_path = collect_grouped_images(
+                        drone_inputs=drone_list,
+                        dslr_inputs=dslr_list,
+                        recursive=recursive,
+                    )
                 except FileNotFoundError as e:
                     log(f"✘ {e}", "err")
                     return
                 if not images:
-                    log(f"✘ 지원 이미지 파일 없음: {inp}", "err")
+                    log(f"✘ 지원 이미지 파일 없음", "err")
                     if not recursive:
                         log("  힌트: '하위 폴더까지 모두 검색' 옵션을 켜 보세요.", "warn")
                     return
-                log(f"✔ 이미지 {len(images)}장 발견", "ok")
+                log(f"✔ 이미지 총 {len(images)}장 발견", "ok")
                 set_progress(10)
 
                 # 3. EXIF 추출
@@ -557,10 +623,30 @@ def run_gui():
                     log("✘ EXIF 추출 실패", "err")
                     return
 
-                records = [parse_record(r) for r in raw_records]
+                records = []
+                for r in raw_records:
+                    sf = r.get("SourceFile", "")
+                    meta = meta_by_path.get(sf, {})
+                    records.append(
+                        parse_record(
+                            r,
+                            camera_type=meta.get("camera_type"),
+                            folder_label=meta.get("folder"),
+                        )
+                    )
+
                 gps_ok = sum(1 for r in records if r["Lat_DD"] is not None)
-                dir_ok = sum(1 for r in records if r["CamDirection_deg"] is not None)
-                log(f"✔ GPS: {gps_ok}/{len(records)}장  방향: {dir_ok}/{len(records)}장", "ok")
+                drone_cnt = sum(1 for r in records if r.get("CameraType") == CAMERA_TYPE_DRONE)
+                dslr_cnt = sum(1 for r in records if r.get("CameraType") == CAMERA_TYPE_DSLR)
+                dir_ok = sum(
+                    1 for r in records
+                    if r.get("CameraType") == CAMERA_TYPE_DRONE and r["CamDirection_deg"] is not None
+                )
+                log(
+                    f"✔ GPS: {gps_ok}/{len(records)}장  |  "
+                    f"드론: {drone_cnt}장 (방향 {dir_ok}장)  |  DSLR: {dslr_cnt}장",
+                    "ok",
+                )
                 if gps_ok == 0:
                     log("⚠ GPS 좌표가 있는 사진이 없습니다. 지도는 생성되지 않습니다.", "warn")
                 set_progress(45)
@@ -573,7 +659,7 @@ def run_gui():
                     transformer = build_transformers(target_crs)
                     if transformer:
                         used_crs = target_crs
-                        log("✔ 좌표 변환 준비 완료", "ok")
+                        log("✔ 좌표 변환 준비 완료 (Proj_X=동향 E, Proj_Y=북향 N)", "ok")
                     else:
                         log(f"⚠ 좌표계 '{target_crs}' 초기화 실패 → 변환 없이 진행", "warn")
                 elif not HAS_PYPROJ:
@@ -606,34 +692,42 @@ def run_gui():
                     last_pct = [-1]
 
                     def thumb_progress(done, total):
-                        # 썸네일 단계가 전체 진행률의 70-95% 구간을 차지한다.
                         set_progress(70 + 25 * done / total)
                         pct = done * 100 // total
-                        # 로그 폭주를 막기 위해 10% 단위로만 기록한다.
                         if pct // 10 != last_pct[0] // 10:
                             last_pct[0] = pct
                             log(f"  🖼 썸네일 {done}/{total} ({pct}%)", "")
 
                     if write_map(records, map_path, thumb_size=thumb_size,
-                                 progress=thumb_progress if thumb_size > 0 else None):
+                                 progress=thumb_progress if thumb_size > 0 else None,
+                                 exiftool_path=et):
                         saved_map = map_path
                         log("✔ 지도 저장 완료", "ok")
                     else:
                         log("⚠ GPS 데이터가 없어 지도를 만들지 못했습니다.", "warn")
                 set_progress(95)
 
-                # 8. 요약
+                # 8. 요약 (최대 MAX_SUMMARY_ROWS 행까지만 출력하여 대량 사진 시 UI 멈춤 방지)
                 log("", "")
-                log("─" * 52, "")
-                log(f"{'파일명':<22} {'방향(°)':<10} {'방위':<5} {'위도':>11}", "info")
-                log("─" * 52, "")
-                for r in records:
+                log("─" * 64, "")
+                log(f"{'파일명':<20} {'구분/폴더':<16} {'방향(°)':<8} {'방위':<4} {'위도':>11}", "info")
+                log("─" * 64, "")
+                for r in records[:MAX_SUMMARY_ROWS]:
                     lat_s = f"{r['Lat_DD']:.5f}" if r["Lat_DD"] is not None else "N/A"
-                    dir_s = f"{r['CamDirection_deg']:.1f}" if r["CamDirection_deg"] is not None else "N/A"
-                    card  = r.get("CamDirection_cardinal", "") or "-"
-                    fname = str(r["FileName"])[:20]
-                    log(f"{fname:<22} {dir_s:<10} {card:<5} {lat_s:>11}", "")
-                log("─" * 52, "")
+                    is_drone = r.get("CameraType") == CAMERA_TYPE_DRONE
+                    dir_s = (
+                        f"{r['CamDirection_deg']:.1f}"
+                        if (is_drone and r.get("CamDirection_deg") is not None)
+                        else "-"
+                    )
+                    card  = (r.get("CamDirection_cardinal", "") or "-") if is_drone else "-"
+                    cam_lbl = "드론" if is_drone else "DSLR"
+                    grp_s = f"{cam_lbl}:{r.get('Folder', '기본')}"[:15]
+                    fname = str(r["FileName"])[:19]
+                    log(f"{fname:<20} {grp_s:<16} {dir_s:<8} {card:<4} {lat_s:>11}", "")
+                if len(records) > MAX_SUMMARY_ROWS:
+                    log(f"  … 외 {len(records) - MAX_SUMMARY_ROWS}개 레코드 (전체 내용은 CSV 참조)", "info")
+                log("─" * 64, "")
                 log("✅ 모든 작업 완료!", "ok")
                 set_progress(100)
 
@@ -664,12 +758,12 @@ def run_gui():
 
     # ── 창 중앙 배치 ────────────────────────────────────────────────────────
     root.update_idletasks()
-    w, h = 780, 650
+    w, h = 820, 680
     sw = root.winfo_screenwidth()
     sh = root.winfo_screenheight()
     root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-    # 800ms 후 스플래시 창 파괴 및 메인 창 표출
+    # 150ms 후 스플래시 창 파괴 및 메인 창 표출
     def show_main():
         try:
             splash.destroy()
@@ -677,12 +771,13 @@ def run_gui():
             pass
         root.deiconify()
 
-    root.after(800, show_main)
+    root.after(150, show_main)
 
     # 창을 닫을 때 현재 입력값을 저장해 다음 실행에서 그대로 복원되게 한다.
     def on_close():
         settings.update({
-            "input": v_input.get().strip(),
+            "drone_input": v_drone_input.get().strip(),
+            "dslr_input": v_dslr_input.get().strip(),
             "output": v_output.get().strip(),
             "crs": next((c[1] for c in CRS_OPTIONS if c[0] == v_crs.get()), "tm"),
             "make_map": v_make_map.get(),

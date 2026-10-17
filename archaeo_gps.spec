@@ -27,9 +27,6 @@ a = Analysis(
         "pyproj.transformer",
         "pyproj.crs",
         "pyproj.datadir",
-        "pandas",
-        "pandas.core",
-        "pandas.io.formats.excel",
         "tkinter",
         "tkinter.ttk",
         "tkinter.filedialog",
@@ -43,7 +40,7 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        "matplotlib", "scipy", "numpy.distutils",
+        "pandas", "matplotlib", "scipy", "numpy.distutils",
         "IPython", "jupyter", "notebook",
         "cv2", "sklearn",
     ],

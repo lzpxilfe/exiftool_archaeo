@@ -88,6 +88,28 @@ NADIR_PITCH_THRESHOLD = -85.0   # 이 값 이하의 짐벌 Pitch는 수직(Nadir
 
 ENV_EXIFTOOL_PATH = "EXIFTOOL_PATH"  # exiftool 경로 지정용 환경 변수명
 
+CAMERA_TYPE_DRONE = "drone"
+CAMERA_TYPE_DSLR = "dslr"
+
+DRONE_MAKES = ("dji", "autel", "parrot", "skydio", "yuneec")
+
+# 입력 폴더별로 점 색상을 구분하기 위한 고대비 팔레트 (위성 지도 위에서 잘 보이는 색상)
+FOLDER_PALETTE_DRONE = [
+    "#e94560",  # 코랄 레드 (드론 기본)
+    "#ff9f1c",  # 앰버 오렌지
+    "#f72585",  # 마젠타 핑크
+    "#ffbe0b",  # 골드 옐로우
+    "#fb5607",  # 블레이즈 오렌지
+]
+
+FOLDER_PALETTE_DSLR = [
+    "#38bdf8",  # 스카이 블루 (DSLR 기본)
+    "#34d399",  # 에메랄드 그린
+    "#a78bfa",  # 바이올렛 퍼플
+    "#2dd4bf",  # 틸 민트
+    "#f472b6",  # 로즈 핑크
+]
+
 EXIF_TAGS = [
     "FileName",
     "DateTimeOriginal", "CreateDate",
@@ -150,40 +172,47 @@ CRS_PRESETS = {
 
 def dms_to_dd(dms_str: str) -> float | None:
     """
-    Convert ExifTool DMS string to Decimal Degrees.
-    Handles both:
+    Convert ExifTool DMS or decimal string to Decimal Degrees.
+    Handles:
       '36 deg 22' 14.45" N'
-      '36.371791666'   (already decimal)
+      '36.371791666'          (already decimal)
+      '36.371791666 N'        (decimal with hemisphere)
+      '-33 deg 52' 07.68"'    (signed DMS)
     Returns None on failure.
     """
     if dms_str is None:
         return None
     s = str(dms_str).strip()
+    if not s:
+        return None
 
-    # Already decimal?
-    try:
-        val = float(s.replace("°", "").strip())
-        # Sanity check: plain numbers from exiftool -n are decimal
+    # 1) Plain decimal or decimal with optional ° and trailing hemisphere (e.g. "36.3717° N")
+    dec_m = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*°?\s*([NSEW])?", s, re.IGNORECASE)
+    if dec_m:
+        val = float(dec_m.group(1))
+        hemi = dec_m.group(2)
+        if hemi and hemi.upper() in ("S", "W"):
+            val = -abs(val)
         return val
-    except ValueError:
-        pass
 
-    # DMS pattern: 36 deg 22' 14.45" N
+    # 2) DMS pattern: 36 deg 22' 14.45" N
     pattern = r"""
-        (\d+)\s*deg\s+   # degrees
-        (\d+)['′]\s*     # minutes
-        ([\d.]+)[\"″]\s* # seconds
-        ([NSEW])?        # optional hemisphere
+        ([+-]?\d+)\s*deg\s+ # degrees (optional sign)
+        (\d+)['′]\s*        # minutes
+        ([\d.]+)[\"″]\s*    # seconds
+        ([NSEW])?           # optional hemisphere
     """
     m = re.search(pattern, s, re.VERBOSE | re.IGNORECASE)
     if not m:
         return None
 
-    deg, mn, sec, hemi = m.groups()
-    dd = float(deg) + float(mn) / 60.0 + float(sec) / 3600.0
+    deg_s, mn, sec, hemi = m.groups()
+    sign = -1.0 if deg_s.startswith("-") else 1.0
+    dd = abs(float(deg_s)) + float(mn) / 60.0 + float(sec) / 3600.0
+    dd *= sign
 
     if hemi and hemi.upper() in ("S", "W"):
-        dd = -dd
+        dd = -abs(dd)
     return dd
 
 
@@ -237,7 +266,8 @@ def _is_valid_exiftool(path_str: str) -> bool:
     """단독형/분리형(exiftool_files) exiftool 실행 파일인지 검증한다.
 
     분리형 배포판은 exiftool.exe 옆에 perl5xx.dll 이 든 exiftool_files 폴더가
-    있어야 동작한다. 폴더가 없으면 실제로 한 번 실행해 보고 판단한다.
+    있어야 동작한다. 폴더가 없거나 사용자 지정 파일명인 경우 실제로 -ver 를
+    실행해 유효한 ExifTool 바이너리인지 확인한다.
     """
     p = Path(path_str)
     if not p.is_file():
@@ -245,8 +275,9 @@ def _is_valid_exiftool(path_str: str) -> bool:
 
     has_files_dir = (p.parent / "exiftool_files").is_dir()
 
-    # 분리형인데 폴더가 없거나 단독형인데 내부 Perl DLL 손상이 의심되는 경우 자가 검증 실행
-    if p.name.lower() in EXIFTOOL_NAMES and not has_files_dir:
+    # 표준 이름(exiftool/exiftool.exe)이면서 옆에 exiftool_files 폴더가 있는 경우에만
+    # 빠른 통과를 허용하고, 그 외(단독형 바이너리 또는 임의 파일명)는 모두 -ver 실행으로 검증한다.
+    if not (p.name.lower() in EXIFTOOL_NAMES and has_files_dir):
         startupinfo = None
         if os.name == "nt":
             startupinfo = subprocess.STARTUPINFO()
@@ -260,14 +291,18 @@ def _is_valid_exiftool(path_str: str) -> bool:
             )
         except Exception:
             return False
-        # -ver 은 "13.10" 같은 버전 문자열만 출력한다. 실패 시 Perl DLL 손상으로 간주.
-        if res.returncode != 0 or not res.stdout.strip():
+        # -ver 은 "13.10" 같은 버전 문자열만 출력한다. 실패 시 유효하지 않은 실행 파일로 간주.
+        ver_out = res.stdout.strip()
+        if res.returncode != 0 or not re.match(r"^\d+\.\d+", ver_out):
             return False
     return True
 
 
 def _exiftool_candidate_dirs() -> list[Path]:
-    """exiftool 을 탐색할 디렉토리 후보를 우선순위 순으로 생성한다."""
+    """exiftool 을 탐색할 안전한 로컬 디렉토리 후보를 우선순위 순으로 생성한다.
+
+    보안을 위해 Downloads / Desktop 등 신뢰할 수 없는 다운로드 폴더는 자동 탐색에서 제외한다.
+    """
     dirs: list[Path] = []
 
     def add(base: Path | None) -> None:
@@ -292,15 +327,6 @@ def _exiftool_candidate_dirs() -> list[Path]:
     # 3. 현재 작업 디렉토리
     try:
         add(Path.cwd())
-    except Exception:
-        pass
-
-    # 4. 사용자 홈의 관례적인 위치 (바탕화면/다운로드 등, OS 무관하게 존재하면 사용)
-    try:
-        home = Path.home()
-        for folder in ("Desktop", "바탕 화면", "Downloads", "Documents"):
-            add(home / folder)
-        add(home)
     except Exception:
         pass
 
@@ -368,25 +394,33 @@ def find_exiftool(hint: str | None = None) -> str:
     )
 
 
+# Windows 8.3 단축 경로 변환용 ctypes 시그니처 (모듈 로드 시 1회만 초기화하여 멀티스레드 안전성 확보)
+_GetShortPathNameW = None
+if os.name == "nt":
+    try:
+        import ctypes
+        from ctypes import wintypes
+        _GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        _GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        _GetShortPathNameW.restype = wintypes.DWORD
+    except Exception:
+        _GetShortPathNameW = None
+
+
 def get_short_path_name(long_name: str) -> str:
-    """Convert long Windows paths with spaces to 8.3 short paths to prevent subprocess argument splitting."""
-    if os.name != 'nt':
+    """Convert long Windows paths with spaces/CJK chars to 8.3 short paths."""
+    if os.name != "nt" or _GetShortPathNameW is None:
         return long_name
     import ctypes
-    from ctypes import wintypes
     try:
         buf_size = 512
         buffer = ctypes.create_unicode_buffer(buf_size)
-        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
-        GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
-        GetShortPathNameW.restype = wintypes.DWORD
-        
-        result = GetShortPathNameW(long_name, buffer, buf_size)
+        result = _GetShortPathNameW(long_name, buffer, buf_size)
         if result == 0:
             return long_name
         if result > buf_size:
             buffer = ctypes.create_unicode_buffer(result)
-            GetShortPathNameW(long_name, buffer, result)
+            _GetShortPathNameW(long_name, buffer, result)
         return buffer.value
     except Exception:
         return long_name
@@ -427,7 +461,14 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
         # block을 나왔으므로 f.close() 되어 윈도우 파일 잠금 해제됨!
         
         # 2. ExifTool 일괄 실행 (Batch mode)
-        cmd = [exiftool_path, "-json", "-charset", "filename=UTF8", "-@", temp_file_path]
+        # -c "%d deg %d' %.6f\"" 로 초 소수점 6자리(~0.03mm) 정밀도를 유지한다.
+        cmd = [
+            exiftool_path,
+            "-json",
+            "-c", "%d deg %d' %.6f\"",
+            "-charset", "filename=UTF8",
+            "-@", temp_file_path,
+        ]
 
         # 사진 수에 비례해 타임아웃을 늘린다. 수백~수천 장 배치에서 고정 30초로는
         # 정상 동작 중에도 중간에 끊기기 때문이다.
@@ -461,6 +502,11 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
                     errors.append("ExifTool 반환 데이터 형식 오류 (JSON 리스트 아님)")
             except json.JSONDecodeError as je:
                 errors.append(f"JSON 파싱 실패: {je}\n출력: {result.stdout[:300]}")
+            # 일부 파일 읽기 실패(returncode == 1) 시 stderr 경고를 누락하지 않고 전달
+            if result.returncode == 1 and result.stderr and result.stderr.strip():
+                for line in result.stderr.strip().splitlines():
+                    if line.strip():
+                        errors.append(f"ExifTool 부분 경고: {line.strip()}")
         else:
             err_msg = result.stderr.strip() if result.stderr else f"ExitCode={result.returncode}"
             errors.append(f"ExifTool 실행 실패: {err_msg}")
@@ -504,6 +550,72 @@ def collect_images(input_path: str, recursive: bool = False) -> list[str]:
     raise FileNotFoundError(f"입력 경로를 찾을 수 없습니다: {input_path}")
 
 
+def _folder_label_for(img_path: Path, root_path: Path) -> str:
+    """입력 루트 경로 대비 사진이 속한 폴더 라벨을 생성한다.
+
+    하위 폴더 재귀 탐색 시 '상위폴더/하위폴더' 형태로 구분해 주므로,
+    폴더별로 점 색상과 그룹을 다르게 표현할 수 있다.
+    """
+    if root_path.is_file():
+        return root_path.parent.name or "기본"
+    try:
+        rel_parent = img_path.parent.relative_to(root_path)
+        if str(rel_parent) in ("", "."):
+            return root_path.name or str(root_path)
+        return f"{root_path.name}/{rel_parent.as_posix()}"
+    except ValueError:
+        return img_path.parent.name or "기본"
+
+
+def collect_grouped_images(
+    drone_inputs: list[str] | None = None,
+    dslr_inputs: list[str] | None = None,
+    generic_inputs: list[str] | None = None,
+    recursive: bool = False,
+) -> tuple[list[str], dict[str, dict[str, str | None]]]:
+    """드론/DSLR/일반 입력 경로들에서 이미지를 수집하고 출처 메타정보를 매핑한다.
+
+    Returns:
+        (image_paths, meta_by_path)
+        meta_by_path[abs_path] = {"camera_type": "drone"|"dslr"|None, "folder": 폴더명}
+    """
+    ordered_paths: list[str] = []
+    meta_by_path: dict[str, dict[str, str | None]] = {}
+
+    groups: list[tuple[str | None, list[str]]] = [
+        (CAMERA_TYPE_DRONE, [p for p in (drone_inputs or []) if p and str(p).strip()]),
+        (CAMERA_TYPE_DSLR,  [p for p in (dslr_inputs or []) if p and str(p).strip()]),
+        (None,              [p for p in (generic_inputs or []) if p and str(p).strip()]),
+    ]
+
+    for cam_type, path_list in groups:
+        for raw_in in path_list:
+            root_p = Path(raw_in).expanduser().resolve()
+            found = collect_images(str(root_p), recursive=recursive)
+            for f_str in found:
+                f_resolved = str(Path(f_str).resolve().absolute())
+                folder_lbl = _folder_label_for(Path(f_resolved), root_p)
+                if f_resolved not in meta_by_path:
+                    ordered_paths.append(f_resolved)
+                meta_by_path[f_resolved] = {
+                    "camera_type": cam_type,
+                    "folder": folder_lbl,
+                }
+
+    return ordered_paths, meta_by_path
+
+
+def infer_camera_type(raw: dict) -> str:
+    """EXIF 태그로부터 드론(drone)인지 일반 카메라(dslr)인지 판별한다."""
+    for dji_tag in ("GimbalYawDegree", "GimbalPitchDegree", "FlightYawDegree", "FlightPitchDegree"):
+        if raw.get(dji_tag) is not None:
+            return CAMERA_TYPE_DRONE
+    make = str(raw.get("Make", "")).strip().lower()
+    if any(k in make for k in DRONE_MAKES):
+        return CAMERA_TYPE_DRONE
+    return CAMERA_TYPE_DSLR
+
+
 def build_transformers(target_crs: str) -> tuple | None:
     """Build WGS84 → target CRS transformer pair."""
     if not HAS_PYPROJ:
@@ -531,7 +643,11 @@ def transform_coords(transformer, lat: float, lon: float) -> tuple[float | None,
 # Record processing
 # ---------------------------------------------------------------------------
 
-def parse_record(raw: dict) -> dict:
+def parse_record(
+    raw: dict,
+    camera_type: str | None = None,
+    folder_label: str | None = None,
+) -> dict:
     """Parse one ExifTool JSON record into a clean dict."""
     r = {}
 
@@ -542,6 +658,29 @@ def parse_record(raw: dict) -> dict:
     r["Make"] = raw.get("Make", "")
     r["Model"] = raw.get("Model", "")
 
+    resolved_type = (
+        camera_type
+        or raw.get("CameraType")
+        or raw.get("_CameraType")
+        or infer_camera_type(raw)
+    )
+    resolved_type = str(resolved_type).strip().lower()
+    if resolved_type not in (CAMERA_TYPE_DRONE, CAMERA_TYPE_DSLR):
+        resolved_type = infer_camera_type(raw)
+    r["CameraType"] = resolved_type
+
+    resolved_folder = (
+        folder_label
+        if folder_label is not None
+        else (raw.get("Folder") or raw.get("_Folder") or "")
+    )
+    if not resolved_folder and r["SourceFile"]:
+        try:
+            resolved_folder = Path(r["SourceFile"]).parent.name
+        except Exception:
+            resolved_folder = ""
+    r["Folder"] = str(resolved_folder) if resolved_folder else "기본"
+
     # GPS coordinates
     lat_raw = raw.get("GPSLatitude")
     lon_raw = raw.get("GPSLongitude")
@@ -549,15 +688,15 @@ def parse_record(raw: dict) -> dict:
     lat = dms_to_dd(lat_raw)
     lon = dms_to_dd(lon_raw)
 
-    # Apply hemisphere refs if not embedded in string
+    # Apply hemisphere refs if not embedded in string ("S"/"South", "W"/"West" 모두 처리)
     if lat is not None and lat > 0:
         lat_ref = str(raw.get("GPSLatitudeRef", "N")).strip().upper()
-        if lat_ref == "S":
+        if lat_ref.startswith("S"):
             lat = -lat
 
     if lon is not None and lon > 0:
         lon_ref = str(raw.get("GPSLongitudeRef", "E")).strip().upper()
-        if lon_ref == "W":
+        if lon_ref.startswith("W"):
             lon = -lon
 
     r["Lat_DD"] = round(lat, 8) if lat is not None else None
@@ -619,38 +758,86 @@ except ImportError:
     HAS_PILLOW = False
 
 
+def _extract_raw_preview_bytes(source_file: str, exiftool_path: str | None = None) -> bytes | None:
+    """Pillow 가 직접 열지 못하는 RAW/HEIC 파일에서 ExifTool 로 내장 프리뷰 이미지를 추출한다."""
+    et = exiftool_path
+    if not et:
+        try:
+            et = find_exiftool(None)
+        except FileNotFoundError:
+            return None
+
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+    for tag in ("-PreviewImage", "-JpgFromRaw", "-ThumbnailImage"):
+        try:
+            res = subprocess.run(
+                [et, "-b", tag, str(Path(source_file).resolve())],
+                capture_output=True,
+                timeout=10,
+                startupinfo=startupinfo,
+            )
+            if res.returncode == 0 and res.stdout and len(res.stdout) > 128:
+                return res.stdout
+        except Exception:
+            continue
+    return None
+
+
+def _encode_pil_to_b64(img, max_size: int, quality: int) -> str:
+    """PIL Image 객체를 방향 보정·리사이즈 후 Base64 JPEG 문자열로 인코딩한다."""
+    try:
+        img.draft("RGB", (max_size * 2, max_size * 2))
+    except Exception:
+        pass
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    resample = getattr(_PILImage, "Resampling", _PILImage).LANCZOS
+    img.thumbnail((max_size, max_size), resample)
+    buf = _io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=quality)
+    return _base64.b64encode(buf.getvalue()).decode()
+
+
 def extract_thumbnail(source_file: str,
                       max_size: int = THUMB_SIZE_DEFAULT,
-                      quality: int = THUMB_QUALITY_DEFAULT) -> str | None:
+                      quality: int = THUMB_QUALITY_DEFAULT,
+                      exiftool_path: str | None = None) -> str | None:
     """
     Open the original photo using Windows short path name to prevent encoding issues,
     resize to thumbnail, and return base64 JPEG string.
+    Falls back to ExifTool embedded preview extraction for RAW/HEIC formats.
     """
     if not HAS_PILLOW:
         return None
+    short_file_path = get_short_path_name(source_file)
     try:
-        # 한글/공백 인코딩 꼬임 방지를 위해 8.3 단축 경로명으로 변환하여 Pillow open 실행!
-        short_file_path = get_short_path_name(source_file)
         with _PILImage.open(short_file_path) as img:
-            # Preserve EXIF orientation
+            return _encode_pil_to_b64(img, max_size, quality)
+    except Exception as pil_err:
+        # RAW / HEIC 등 Pillow 가 직접 열지 못하는 포맷은 ExifTool 내장 프리뷰로 폴백
+        raw_bytes = _extract_raw_preview_bytes(source_file, exiftool_path=exiftool_path)
+        if raw_bytes:
             try:
-                from PIL import ImageOps
-                img = ImageOps.exif_transpose(img)
+                with _PILImage.open(_io.BytesIO(raw_bytes)) as img:
+                    return _encode_pil_to_b64(img, max_size, quality)
             except Exception:
                 pass
-            img.thumbnail((max_size, max_size), _PILImage.LANCZOS)
-            buf = _io.BytesIO()
-            img.convert("RGB").save(buf, format="JPEG", quality=quality)
-            return _base64.b64encode(buf.getvalue()).decode()
-    except Exception as e:
-        print(f"⚠️  썸네일 추출 에러 ({source_file}): {e}", file=sys.stderr)
+        print(f"⚠️  썸네일 추출 에러 ({source_file}): {pil_err}", file=sys.stderr)
         return None
 
 
 def extract_thumbnails(source_files: list[str],
                        max_size: int = THUMB_SIZE_DEFAULT,
                        quality: int = THUMB_QUALITY_DEFAULT,
-                       progress=None) -> dict[str, str]:
+                       progress=None,
+                       exiftool_path: str | None = None) -> dict[str, str]:
     """여러 사진의 썸네일을 병렬로 추출한다.
 
     수백 장 규모에서 순차 처리는 지도 생성의 가장 큰 병목이므로 스레드 풀을
@@ -678,7 +865,7 @@ def extract_thumbnails(source_files: list[str],
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(extract_thumbnail, f, max_size, quality): f
+            pool.submit(extract_thumbnail, f, max_size, quality, exiftool_path): f
             for f in targets
         }
         for fut in as_completed(futures):
@@ -700,7 +887,7 @@ def extract_thumbnails(source_files: list[str],
 # ---------------------------------------------------------------------------
 
 CSV_COLUMNS = [
-    "FileName", "DateTime", "Make", "Model",
+    "FileName", "CameraType", "Folder", "DateTime", "Make", "Model",
     "Lat_DD", "Lon_DD", "Alt_m",
     "CamDirection_deg", "CamDirection_cardinal",
     "GimbalYaw", "GimbalPitch", "GimbalRoll",
@@ -712,30 +899,33 @@ CSV_COLUMNS = [
 
 
 def write_csv(records: list[dict], output_path: str, transformer=None, target_crs: str = ""):
-    """Write records to CSV."""
+    """Write records to UTF-8 BOM CSV using standard library csv module.
+
+    Note on projected coordinates (GIS vs Korean Surveying convention):
+      - Proj_X: Easting (동향 좌표, m)
+      - Proj_Y: Northing (북향 좌표, m)
+    """
+    import csv
+
     rows = []
     for rec in records:
         row = {col: rec.get(col, "") for col in CSV_COLUMNS}
 
-        # Add projected coordinates
+        # Add projected coordinates (always_xy=True -> x=Easting, y=Northing)
         x, y = transform_coords(transformer, rec.get("Lat_DD"), rec.get("Lon_DD"))
         row["Proj_X"] = round(x, 3) if x is not None else ""
         row["Proj_Y"] = round(y, 3) if y is not None else ""
         row["Proj_CRS"] = target_crs if (x is not None) else ""
         rows.append(row)
 
-    if HAS_PANDAS:
-        import pandas as pd
-        df = pd.DataFrame(rows, columns=CSV_COLUMNS)
-        df.to_csv(output_path, index=False, encoding="utf-8-sig")
-    else:
-        import csv
-        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-            writer.writeheader()
-            writer.writerows(rows)
+    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
 
     print(f"✅ CSV 저장: {output_path}  ({len(rows)}개 레코드)")
+    if target_crs:
+        print("   ℹ️  투영 좌표 축 안내: Proj_X = 동향(Easting, E), Proj_Y = 북향(Northing, N) [GIS 표준]")
 
 
 def write_geojson(records: list[dict], output_path: str) -> bool:
@@ -773,13 +963,6 @@ def write_geojson(records: list[dict], output_path: str) -> bool:
     return True
 
 
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Leaflet HTML map generation
 # ---------------------------------------------------------------------------
@@ -787,13 +970,16 @@ def write_geojson(records: list[dict], output_path: str) -> bool:
 def write_map(records: list[dict], output_path: str,
               thumb_size: int = THUMB_SIZE_DEFAULT,
               thumb_quality: int = THUMB_QUALITY_DEFAULT,
-              progress=None) -> bool:
+              progress=None,
+              exiftool_path: str | None = None) -> bool:
     """
     Generate a Leaflet.js HTML map with:
-      - Side panel layout
-      - Zoomable/Pannable photo Lightbox using mouse scroll wheel and drag
-      - Clean tile layer choices including Vworld layers (Esri Satellite, OSM, Vworld layers)
-      - Nadir target icons for vertical shots (Pitch <= NADIR_PITCH_THRESHOLD)
+      - Per-folder color & symbol differentiation
+      - Drone vs DSLR marker differentiation (only Drone markers show directional arrows;
+        DSLR markers render as compact dots so dense excavation shots don't clutter)
+      - Compact, non-occluding marker design + real-time size/opacity sliders & 'H' hide key
+      - Side panel layout & Zoomable/Pannable photo Lightbox
+      - Independent tile layer instances (fixing blank map on base layer switch)
 
     progress: progress(done, total) 콜백 (썸네일 추출 진행률, 선택)
     Returns: 지도를 실제로 저장했으면 True, 표시할 GPS 데이터가 없으면 False
@@ -810,8 +996,16 @@ def write_map(records: list[dict], output_path: str,
     if thumb_size > 0:
         thumbs = extract_thumbnails(
             [r.get("SourceFile", "") for r in plotted],
-            max_size=thumb_size, quality=thumb_quality, progress=progress,
+            max_size=thumb_size, quality=thumb_quality,
+            progress=progress, exiftool_path=exiftool_path,
         )
+
+    # 폴더별 그룹 메타데이터 (색상·모양 배정)
+    # 드론 폴더와 DSLR 폴더에 서로 다른 색상 팔레트와 도형을 배정한다.
+    folder_groups: dict[str, dict] = {}
+    drone_folder_idx = 0
+    dslr_folder_idx = 0
+    dslr_shapes = ["circle", "diamond", "square", "triangle"]
 
     features = []
     for rec in plotted:
@@ -831,16 +1025,54 @@ def write_map(records: list[dict], output_path: str,
         flight_yaw   = rec.get("FlightYaw")
         gimbal_yaw   = rec.get("GimbalYaw")
 
+        cam_type = str(rec.get("CameraType") or infer_camera_type(rec)).strip().lower()
+        if cam_type not in (CAMERA_TYPE_DRONE, CAMERA_TYPE_DSLR):
+            cam_type = infer_camera_type(rec)
+        is_drone = (cam_type == CAMERA_TYPE_DRONE)
+
+        raw_folder = str(rec.get("Folder") or "").strip()
+        if not raw_folder and source_file:
+            try:
+                raw_folder = Path(source_file).parent.name
+            except Exception:
+                raw_folder = ""
+        if not raw_folder:
+            raw_folder = "드론" if is_drone else "DSLR"
+
+        group_key = f"{cam_type}:{raw_folder}"
+        if group_key not in folder_groups:
+            if is_drone:
+                color = FOLDER_PALETTE_DRONE[drone_folder_idx % len(FOLDER_PALETTE_DRONE)]
+                shape = "arrow"
+                drone_folder_idx += 1
+            else:
+                color = FOLDER_PALETTE_DSLR[dslr_folder_idx % len(FOLDER_PALETTE_DSLR)]
+                shape = dslr_shapes[dslr_folder_idx % len(dslr_shapes)]
+                dslr_folder_idx += 1
+            folder_groups[group_key] = {
+                "key": group_key,
+                "cam_type": cam_type,
+                "folder": html.escape(raw_folder),
+                "color": color,
+                "shape": shape,
+                "count": 0,
+            }
+        folder_groups[group_key]["count"] += 1
+        grp = folder_groups[group_key]
+
         yaw_display = f"{yaw}° ({card})" if yaw is not None else "N/A"
 
-        # Nadir check (straight down)
+        # Nadir check (straight down) — 드론 촬영에만 적용
         is_nadir = False
-        if gimbal_pitch is not None:
+        if is_drone and gimbal_pitch is not None:
             try:
                 if float(gimbal_pitch) <= NADIR_PITCH_THRESHOLD:
                     is_nadir = True
             except (ValueError, TypeError):
                 pass
+
+        # 드론만 점에 화살표로 방향을 표시하고, DSLR은 점으로만 표시한다.
+        has_dir = bool(is_drone and (yaw is not None))
 
         thumb_b64 = thumbs.get(source_file)
 
@@ -850,10 +1082,13 @@ def write_map(records: list[dict], output_path: str,
         gy_val = f"{gimbal_yaw}°" if gimbal_yaw is not None else "N/A"
         fy_val = f"{flight_yaw}°" if flight_yaw is not None else "N/A"
 
-        # 파일명은 그대로 innerHTML 에 들어가므로 반드시 이스케이프한다.
+        # 파일명·폴더명은 innerHTML 에 들어가므로 반드시 이스케이프한다.
         fname_safe = html.escape(str(fname))
+        folder_safe = grp["folder"]
+        type_badge = "드론" if is_drone else "DSLR"
         popup_html = (
-            "<div style=\"font-family:'Segoe UI',sans-serif;font-size:0.8rem;\">"
+            "<div style=\"font-family:'Segoe UI',sans-serif;font-size:0.78rem;line-height:1.4;\">"
+            f"<span style=\"color:{grp['color']};font-weight:700;\">[{type_badge} · {folder_safe}]</span><br>"
             f"<b>{fname_safe}</b></div>"
         )
 
@@ -861,8 +1096,13 @@ def write_map(records: list[dict], output_path: str,
             "lat": lat,
             "lon": lon,
             "yaw": yaw if yaw is not None else 0,
-            "has_dir": yaw is not None,
+            "has_dir": has_dir,
             "is_nadir": is_nadir,
+            "cam_type": cam_type,
+            "group_key": group_key,
+            "folder": folder_safe,
+            "color": grp["color"],
+            "shape": grp["shape"],
             "popup": popup_html,
             "fname": fname_safe,
             "dt": html.escape(str(dt)) if dt else "N/A",
@@ -880,8 +1120,8 @@ def write_map(records: list[dict], output_path: str,
     center_lat = sum(f["lat"] for f in features) / len(features)
     center_lon = sum(f["lon"] for f in features) / len(features)
     # base64 썸네일이 포함되므로 indent 없이 최소 크기로 직렬화한다
-    # (사진 수백 장이면 들여쓰기만으로 수 MB 가 늘어난다).
     features_json = json.dumps(features, ensure_ascii=False, separators=(",", ":"))
+    groups_json = json.dumps(list(folder_groups.values()), ensure_ascii=False, separators=(",", ":"))
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -891,6 +1131,10 @@ def write_map(records: list[dict], output_path: str,
   <title>ExifTool Archaeo — 고고학 현장 GPS 분석 맵</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <style>
+    :root {{
+      --marker-scale: 1;
+      --marker-opacity: 0.88;
+    }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: 'Noto Sans KR', 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }}
     
@@ -918,6 +1162,33 @@ def write_map(records: list[dict], output_path: str,
       flex: 1;
       height: 100%;
       z-index: 1;
+    }}
+    
+    /* ── 밀집 지역 가림 방지를 위한 컴팩트 마커 스타일 ── */
+    .archaeo-marker-wrap {{
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: var(--marker-opacity);
+      transform: scale(var(--marker-scale));
+      transform-origin: center center;
+      transition: transform 0.12s ease, opacity 0.12s ease;
+    }}
+    .archaeo-marker-wrap:hover {{
+      opacity: 1 !important;
+      transform: scale(calc(var(--marker-scale) * 1.3));
+      z-index: 900 !important;
+    }}
+    .archaeo-marker-wrap.selected-marker {{
+      opacity: 1 !important;
+      transform: scale(calc(var(--marker-scale) * 1.35));
+      filter: drop-shadow(0 0 5px rgba(255, 255, 255, 0.95));
+    }}
+    body.markers-hidden .archaeo-marker-wrap {{
+      opacity: 0 !important;
+      pointer-events: none !important;
     }}
     
     #sidebar {{
@@ -986,19 +1257,81 @@ def write_map(records: list[dict], output_path: str,
     }}
     .copy-btn:hover {{ color: #e94560; border-color: #e94560; }}
 
+    /* ── 좌측 하단 컨트롤 & 폴더별 범례 패널 ── */
     .legend {{
-      background: rgba(22, 33, 62, 0.93);
-      padding: 10px 14px;
+      background: rgba(22, 33, 62, 0.94);
+      padding: 11px 14px;
       border-radius: 8px;
       border: 1px solid #e94560;
-      font-size: 0.76rem;
+      font-size: 0.75rem;
       color: #eee;
-      line-height: 1.9;
-      /* 범례는 읽기 전용이므로 클릭을 통과시킨다.
-         그렇지 않으면 범례에 가린 마커를 클릭할 수 없다. */
-      pointer-events: none;
+      line-height: 1.65;
+      pointer-events: auto;
+      max-width: 310px;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.45);
     }}
-    .legend-dot {{ display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }}
+    .legend-title {{
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }}
+    .legend-group-list {{
+      max-height: 140px;
+      overflow-y: auto;
+      margin-bottom: 8px;
+      padding-right: 4px;
+    }}
+    .legend-item {{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      padding: 2px 0;
+      user-select: none;
+    }}
+    .legend-item input[type="checkbox"] {{
+      accent-color: #e94560;
+      cursor: pointer;
+    }}
+    .legend-swatch {{
+      display: inline-flex;
+      width: 14px;
+      height: 14px;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }}
+    .ctrl-row {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 4px;
+      font-size: 0.72rem;
+      color: #cbd5e1;
+    }}
+    .ctrl-row input[type="range"] {{
+      width: 115px;
+      accent-color: #e94560;
+      cursor: pointer;
+    }}
+    .hide-btn {{
+      margin-top: 7px;
+      width: 100%;
+      background: #0f3460;
+      color: #e2e8f0;
+      border: 1px solid #2d3748;
+      border-radius: 5px;
+      padding: 4px 8px;
+      font-size: 0.72rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }}
+    .hide-btn:hover {{ background: #1a4a90; }}
+    .hide-btn.active {{ background: #e94560; color: #fff; border-color: #e94560; }}
     
     /* ── 라이트박스(마우스 휠 줌 및 드래그 판 지원) ── */
     #lightbox {{
@@ -1058,7 +1391,7 @@ def write_map(records: list[dict], output_path: str,
     <span style="font-size:1.3rem;">🏛️</span>
     <h1>ExifTool Archaeo</h1>
     <span class="sub">고고학 현장 사진 위치·방향 시각화 &nbsp;v{__version__}</span>
-    <span style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
+    <span id="visible-counter" style="margin-left:auto;color:#e94560;font-weight:700;">{len(features)}장</span>
   </div>
   
   <div id="app-container">
@@ -1067,11 +1400,12 @@ def write_map(records: list[dict], output_path: str,
       <div id="sidebar-placeholder" style="text-align: center; margin-top: 60px; color: #a0aec0; line-height: 1.8;">
         <span style="font-size: 3.5rem; display: block; margin-bottom: 15px;">📸</span>
         <b style="color: #fff; font-size: 0.95rem;">사진 상세 정보 패널</b><br>
-        지도 위 화살표 마커를 클릭하시면<br>촬영 방향 정보와 사진 썸네일이<br>이곳에 상세히 연동되어 표시됩니다.
+        지도 위 마커를 클릭하시면<br>촬영 정보와 사진 썸네일이<br>이곳에 상세히 연동되어 표시됩니다.
         <div style="margin-top:18px; font-size:0.75rem; color:#718096; line-height:1.7;">
           ⌨ <b style="color:#94a3b8;">단축키</b><br>
           ← / → : 이전·다음 사진<br>
           F : 전체 사진이 보이도록 맞춤<br>
+          H : 마커 잠시 숨기기 / 표시 (유구 판독용)<br>
           Esc : 사진 확대창 닫기
         </div>
       </div>
@@ -1083,9 +1417,9 @@ def write_map(records: list[dict], output_path: str,
 
   <!-- 라이트박스 구조 -->
   <div id="lightbox" onclick="closeLightbox()">
-    <div class="lightbox-close" onclick="closeLightbox()">&times;</div>
+    <div class="lightbox-close" onclick="event.stopPropagation(); closeLightbox()">&times;</div>
     <div class="lightbox-guide">🖱️ 휠 = 확대/축소 · 드래그 = 이동 · 더블클릭 = 원래 크기 · Esc = 닫기</div>
-    <img id="lightbox-img" src="" onclick="event.stopPropagation()">
+    <img id="lightbox-img" alt="확대 사진" onclick="event.stopPropagation()">
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -1096,65 +1430,27 @@ def write_map(records: list[dict], output_path: str,
       zoomControl: true
     }}).setView([{center_lat}, {center_lon}], 16);
 
-    // ── 베이스 레이어 및 오버레이 ──
-    const esriSatellite = L.tileLayer(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
-      {{ 
-        attribution: 'Tiles &copy; Esri', 
-        maxNativeZoom: 18, 
-        maxZoom: 22 
-      }}
-    );
+    // ── 베이스 레이어 및 오버레이 (레이어 전환 시 백지 방지를 위해 인스턴스 분리) ──
+    const vworldUrl = 'https://xdworld.vworld.kr/2d';
+    const esriUrl = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}';
+    const cartoLabelsUrl = 'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png';
 
-    const labels = L.tileLayer(
-      'https://{{s}}.basemaps.cartocdn.com/light_only_labels/{{z}}/{{x}}/{{y}}{{r}}.png',
-      {{ 
-        attribution: '&copy; CartoDB', 
-        maxNativeZoom: 18, 
-        maxZoom: 22 
-      }}
-    );
+    const vworldCombo = L.layerGroup([
+      L.tileLayer(`${{vworldUrl}}/Satellite/service/{{z}}/{{x}}/{{y}}.png`, {{ attribution: 'Vworld', maxNativeZoom: 18, maxZoom: 22 }}),
+      L.tileLayer(`${{vworldUrl}}/Hybrid/service/{{z}}/{{x}}/{{y}}.png`, {{ attribution: 'Vworld', maxNativeZoom: 18, maxZoom: 22 }})
+    ]);
+    const vworldSatellite = L.tileLayer(`${{vworldUrl}}/Satellite/service/{{z}}/{{x}}/{{y}}.png`, {{ attribution: 'Vworld', maxNativeZoom: 18, maxZoom: 22 }});
+    const vworldBase = L.tileLayer(`${{vworldUrl}}/Base/service/{{z}}/{{x}}/{{y}}.png`, {{ attribution: 'Vworld', maxNativeZoom: 18, maxZoom: 22 }});
 
-    // Vworld layers (브이월드 복원)
-    const vworldSatellite = L.tileLayer(
-      'https://xdworld.vworld.kr/2d/Satellite/service/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: 'Vworld', 
-        maxNativeZoom: 18, 
-        maxZoom: 22 
-      }}
-    );
+    const esriCombo = L.layerGroup([
+      L.tileLayer(esriUrl, {{ attribution: 'Tiles &copy; Esri', maxNativeZoom: 18, maxZoom: 22 }}),
+      L.tileLayer(cartoLabelsUrl, {{ attribution: '&copy; CartoDB', maxNativeZoom: 18, maxZoom: 22 }})
+    ]);
+    const esriSatellite = L.tileLayer(esriUrl, {{ attribution: 'Tiles &copy; Esri', maxNativeZoom: 18, maxZoom: 22 }});
+    const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ attribution: '&copy; OSM', maxNativeZoom: 19, maxZoom: 22 }});
 
-    const vworldHybrid = L.tileLayer(
-      'https://xdworld.vworld.kr/2d/Hybrid/service/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: 'Vworld', 
-        maxNativeZoom: 18, 
-        maxZoom: 22 
-      }}
-    );
-
-    const vworldBase = L.tileLayer(
-      'https://xdworld.vworld.kr/2d/Base/service/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: 'Vworld', 
-        maxNativeZoom: 18, 
-        maxZoom: 22 
-      }}
-    );
-
-    const osm = L.tileLayer(
-      'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
-      {{ 
-        attribution: '&copy; OSM', 
-        maxNativeZoom: 19, 
-        maxZoom: 22 
-      }}
-    );
-
-    // 조합 레이어 정의
-    const vworldCombo = L.layerGroup([vworldSatellite, vworldHybrid]);
-    const esriCombo = L.layerGroup([esriSatellite, labels]);
+    const vworldHybridOverlay = L.tileLayer(`${{vworldUrl}}/Hybrid/service/{{z}}/{{x}}/{{y}}.png`, {{ attribution: 'Vworld', maxNativeZoom: 18, maxZoom: 22 }});
+    const cartoLabelsOverlay = L.tileLayer(cartoLabelsUrl, {{ attribution: '&copy; CartoDB', maxNativeZoom: 18, maxZoom: 22 }});
 
     // 기본 레이어로 브이월드 하이브리드 조합 맵 적용
     vworldCombo.addTo(map);
@@ -1169,8 +1465,8 @@ def write_map(records: list[dict], output_path: str,
         "🗺 일반 지도 (OSM)": osm 
       }},
       {{ 
-        "🏷 브이월드 도로/지명 라벨 (단독 토글)": vworldHybrid,
-        "🏷 CartoDB 라벨 (단독 토글)": labels 
+        "🏷 브이월드 도로/지명 라벨 (추가 토글)": vworldHybridOverlay,
+        "🏷 CartoDB 라벨 (추가 토글)": cartoLabelsOverlay 
       }},
       {{ position: 'topright', collapsed: false }}
     ).addTo(map);
@@ -1192,45 +1488,32 @@ def write_map(records: list[dict], output_path: str,
       translateX = 0;
       translateY = 0;
       updateTransform();
-      
       lb.style.display = 'flex';
-      lb.offsetHeight;
-      lb.classList.add('active');
     }}
 
     function closeLightbox() {{
-      lb.classList.remove('active');
-      setTimeout(() => {{
-        lb.style.display = 'none';
-        lbImg.src = '';
-      }}, 200);
+      lb.style.display = 'none';
+      lbImg.removeAttribute('src');
     }}
 
     function updateTransform() {{
       lbImg.style.transform = `translate(${{translateX}}px, ${{translateY}}px) scale(${{scale}})`;
     }}
 
-    // 마우스 휠 이벤트 (Zoom)
     lbImg.addEventListener('wheel', function(e) {{
       e.preventDefault();
       const zoomFactor = 0.12;
-      if (e.deltaY < 0) {{
-        scale += zoomFactor;
-      }} else {{
-        scale -= zoomFactor;
-      }}
+      scale += (e.deltaY < 0) ? zoomFactor : -zoomFactor;
       scale = Math.min(Math.max(0.4, scale), 6.0);
       updateTransform();
     }});
 
-    // 더블클릭 시 확대/이동 상태 초기화
     lbImg.addEventListener('dblclick', function(e) {{
       e.stopPropagation();
       scale = 1; translateX = 0; translateY = 0;
       updateTransform();
     }});
 
-    // 마우스 드래그 이벤트 (Pan)
     lbImg.addEventListener('mousedown', function(e) {{
       e.preventDefault();
       isDragging = true;
@@ -1251,54 +1534,109 @@ def write_map(records: list[dict], output_path: str,
       lbImg.style.cursor = 'grab';
     }});
 
-    // ── 아이콘 팩토리 (수직촬영 Nadir vs 경사촬영 Yaw 화살표) ───────────────────
-    function makeCustomIcon(f) {{
-      const color = f.has_dir ? '#e94560' : '#718096';
-      let svgHtml = '';
+    // ── 마커 아이콘 팩토리 ───────────────────────────────────────────────────
+    // 1. 밀집 구역에서 지도를 가리지 않도록 기존 22px 외곽 배경 원(r=11)을 제거.
+    // 2. 드론(cam_type === 'drone')만 방향 화살표(또는 수직 촬영 과녁)를 표시.
+    // 3. DSLR(cam_type === 'dslr')은 화살표 없이 폴더별 색상/도형 점으로만 깔끔하게 표시.
+    function renderPointShape(shape, color) {{
+      if (shape === 'diamond') {{
+        return `<polygon points="14,9.5 18.5,14 14,18.5 9.5,14" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
+      }}
+      if (shape === 'square') {{
+        return `<rect x="10.2" y="10.2" width="7.6" height="7.6" rx="1.5" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
+      }}
+      if (shape === 'triangle') {{
+        return `<polygon points="14,9.2 18.6,17.5 9.4,17.5" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
+      }}
+      return `<circle cx="14" cy="14" r="4.0" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
+    }}
 
-      if (f.is_nadir) {{
-        svgHtml = `
-          <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
-            <circle cx="18" cy="18" r="12" fill="none" stroke="${{color}}" stroke-width="2.5" stroke-dasharray="2 2"/>
-            <circle cx="18" cy="18" r="7" fill="none" stroke="${{color}}" stroke-width="1.8"/>
-            <circle cx="18" cy="18" r="3" fill="${{color}}"/>
-            <line x1="18" y1="2" x2="18" y2="34" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
-            <line x1="2" y1="18" x2="34" y2="18" stroke="${{color}}" stroke-width="1" stroke-opacity="0.6"/>
-          </svg>`;
+    function makeCustomIcon(f, isSelected = false) {{
+      const color = f.color || (f.cam_type === 'drone' ? '#e94560' : '#38bdf8');
+      const selRing = isSelected
+        ? `<circle cx="14" cy="14" r="9.5" fill="none" stroke="#ffffff" stroke-width="2.2"/>`
+        : '';
+      let svgBody = '';
+
+      if (f.cam_type === 'drone') {{
+        if (f.is_nadir) {{
+          // 드론 수직(Nadir) 촬영: 지도를 가리지 않는 컴팩트 과녁
+          svgBody = `
+            ${{selRing}}
+            <circle cx="14" cy="14" r="6.5" fill="none" stroke="${{color}}" stroke-width="1.8" stroke-dasharray="2 2"/>
+            <line x1="14" y1="5" x2="14" y2="23" stroke="${{color}}" stroke-width="1" stroke-opacity="0.75"/>
+            <line x1="5" y1="14" x2="23" y2="14" stroke="${{color}}" stroke-width="1" stroke-opacity="0.75"/>
+            <circle cx="14" cy="14" r="2.6" fill="${{color}}" stroke="#0a0f1e" stroke-width="1"/>`;
+        }} else if (f.has_dir) {{
+          // 드론 경사 촬영: 중심점 + 바라보는 방향 화살표 (배경 큰 원 없음)
+          svgBody = `
+            ${{selRing}}
+            <g transform="rotate(${{f.yaw}},14,14)">
+              <line x1="14" y1="14" x2="14" y2="3.2" stroke="#0a0f1e" stroke-width="3.4" stroke-linecap="round"/>
+              <line x1="14" y1="14" x2="14" y2="3.2" stroke="${{color}}" stroke-width="2.0" stroke-linecap="round"/>
+              <polygon points="14,0.8 10.6,7.2 17.4,7.2" fill="${{color}}" stroke="#0a0f1e" stroke-width="0.9"/>
+            </g>
+            <circle cx="14" cy="14" r="3.4" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.2"/>`;
+        }} else {{
+          svgBody = `${{selRing}}<circle cx="14" cy="14" r="3.8" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
+        }}
       }} else {{
-        const arrowSvg = f.has_dir ? `
-          <line x1="18" y1="18" x2="18" y2="4"
-            stroke="${{color}}" stroke-width="2.5" stroke-linecap="round"
-            transform="rotate(${{f.yaw}},18,18)"/>
-          <polygon points="18,1 14.5,9 21.5,9"
-            fill="${{color}}" transform="rotate(${{f.yaw}},18,18)"/>` : '';
-        svgHtml = `
-          <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36">
-            <circle cx="18" cy="18" r="11" fill="${{color}}" fill-opacity="0.18" stroke="${{color}}" stroke-width="2"/>
-            <circle cx="18" cy="18" r="3.5" fill="${{color}}"/>
-            ${{arrowSvg}}
-          </svg>`;
+        // DSLR / 일반 카메라: 화살표 없이 폴더별 깔끔한 점으로만 표현
+        svgBody = `${{selRing}}${{renderPointShape(f.shape, color)}}`;
       }}
 
+      const wrapClass = isSelected ? 'archaeo-marker-wrap selected-marker' : 'archaeo-marker-wrap';
+      const svgHtml = `<div class="${{wrapClass}}"><svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28">${{svgBody}}</svg></div>`;
+
       return L.divIcon({{
-        html: svgHtml, 
+        html: svgHtml,
         className: '',
-        iconSize: [36,36], 
-        iconAnchor: [18,18], 
-        popupAnchor: [0,-22],
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+        popupAnchor: [0, -14],
       }});
     }}
 
-    // ── 데이터 연동 ────────────────────────────────────────────────────────
+    // ── 데이터 연동 및 폴더별 필터링 ─────────────────────────────────────────
     const features = {features_json};
+    const folderGroups = {groups_json};
     const markerGroup = L.featureGroup();
     const markers = [];
+    const activeGroups = new Set(folderGroups.map(g => g.key));
     let currentIndex = -1;
+    let userScale = 1.0;
+
+    // 줌 레벨에 따라 밀집 시 자동으로 마커를 작게, 확대 시 선명하게 조절
+    function updateMarkerScale() {{
+      const z = map.getZoom();
+      let zoomScale = 1.0;
+      if (z <= 14) zoomScale = 0.6;
+      else if (z === 15) zoomScale = 0.72;
+      else if (z === 16) zoomScale = 0.84;
+      else if (z === 17) zoomScale = 0.94;
+      else if (z >= 20) zoomScale = 1.12;
+      const finalScale = (zoomScale * userScale).toFixed(2);
+      document.documentElement.style.setProperty('--marker-scale', finalScale);
+    }}
+    map.on('zoomend', updateMarkerScale);
+
+    function selectMarkerStyle(prevIdx, nextIdx) {{
+      if (prevIdx >= 0 && prevIdx < markers.length) {{
+        markers[prevIdx].setIcon(makeCustomIcon(features[prevIdx], false));
+        markers[prevIdx].setZIndexOffset(0);
+      }}
+      if (nextIdx >= 0 && nextIdx < markers.length) {{
+        markers[nextIdx].setIcon(makeCustomIcon(features[nextIdx], true));
+        markers[nextIdx].setZIndexOffset(1000);
+      }}
+    }}
 
     // 사이드바에 i번째 사진의 상세 정보를 렌더링한다.
     function showDetail(i) {{
       if (i < 0 || i >= features.length) return;
+      const prev = currentIndex;
       currentIndex = i;
+      selectMarkerStyle(prev, i);
       const f = features[i];
 
       document.getElementById('sidebar-placeholder').style.display = 'none';
@@ -1312,8 +1650,17 @@ def write_map(records: list[dict], output_path: str,
         imgHtml = `<div style="width:100%; height:160px; background:#0f2044; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#718096; margin-bottom:15px; border: 1px dashed #2d3748; font-size:0.8rem;">썸네일 이미지 없음</div>`;
       }}
 
+      const isDrone = (f.cam_type === 'drone');
+      const camBadge = `<span style="background:${{f.color}}; color:#0a0f1e; font-weight:700; padding:2px 7px; border-radius:4px; font-size:0.7rem; margin-right:6px; vertical-align:middle;">${{isDrone ? '드론' : 'DSLR'}} · ${{f.folder}}</span>`;
       const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
       const coordText = `${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}`;
+
+      const dirRows = isDrone ? `
+          <tr><td class="label-col">🧭 촬영 방향</td><td style="font-weight:bold; color:${{f.color}}; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
+          <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
+          <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
+          <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
+      ` : '';
 
       contentDiv.innerHTML = `
         <div class="nav-bar">
@@ -1322,17 +1669,16 @@ def write_map(records: list[dict], output_path: str,
           <button class="nav-btn" onclick="gotoPhoto(${{i + 1}})" ${{i === features.length - 1 ? 'disabled' : ''}} title="다음 사진 (→ 키)">다음 ▶</button>
         </div>
         ${{imgHtml}}
-        <h2 style="font-size:1.15rem; font-weight:700; margin-bottom:4px; color:#e94560; word-break:break-all; line-height:1.35;">${{f.fname}}${{angleLabel}}</h2>
+        <div style="margin-bottom:6px;">${{camBadge}}${{angleLabel}}</div>
+        <h2 style="font-size:1.1rem; font-weight:700; margin-bottom:4px; color:#fff; word-break:break-all; line-height:1.35;">${{f.fname}}</h2>
         <div style="font-size:0.8rem; color:#94a3b8; margin-bottom:15px;">🕐 촬영시각: ${{f.dt}}</div>
         <hr style="border:none; border-top:1px solid #2d3748; margin-bottom:15px;">
 
         <table class="sidebar-table">
+          <tr><td class="label-col">📂 입력 폴더</td><td style="color:#e2e8f0;">${{f.folder}} (${{isDrone ? '드론' : 'DSLR'}})</td></tr>
           <tr><td class="label-col">📍 위도/경도</td><td><span style="font-family:monospace; font-weight:bold; color:#fff;">${{coordText}}</span> <button class="copy-btn" onclick="copyCoord('${{coordText}}', this)" title="좌표 복사">복사</button></td></tr>
           <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}}</td></tr>
-          <tr><td class="label-col">🧭 카메라 방향</td><td style="font-weight:bold; color:#e94560; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
-          <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
-          <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
-          <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
+          ${{dirRows}}
           <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
         </table>
       `;
@@ -1343,8 +1689,10 @@ def write_map(records: list[dict], output_path: str,
       if (i < 0 || i >= features.length) return;
       showDetail(i);
       const m = markers[i];
-      map.panTo(m.getLatLng());
-      m.openPopup();
+      if (map.hasLayer(m)) {{
+        map.panTo(m.getLatLng());
+        m.openPopup();
+      }}
     }}
 
     function copyCoord(text, btn) {{
@@ -1373,15 +1721,44 @@ def write_map(records: list[dict], output_path: str,
     }}
 
     features.forEach((f, i) => {{
-      const marker = L.marker([f.lat, f.lon], {{ icon: makeCustomIcon(f) }})
-        .bindPopup(f.popup, {{ maxWidth: 200 }});
+      const marker = L.marker([f.lat, f.lon], {{ icon: makeCustomIcon(f, false) }})
+        .bindPopup(f.popup, {{ maxWidth: 220 }});
       marker.on('click', () => showDetail(i));
       markers.push(marker);
       markerGroup.addLayer(marker);
     }});
 
     markerGroup.addTo(map);
-    map.fitBounds(markerGroup.getBounds().pad(0.18));
+    map.fitBounds(markerGroup.getBounds().pad(0.18), {{ maxZoom: 19 }});
+    updateMarkerScale();
+
+    function applyGroupFilter() {{
+      let visibleCount = 0;
+      features.forEach((f, i) => {{
+        const m = markers[i];
+        if (activeGroups.has(f.group_key)) {{
+          if (!markerGroup.hasLayer(m)) markerGroup.addLayer(m);
+          visibleCount++;
+        }} else {{
+          if (markerGroup.hasLayer(m)) markerGroup.removeLayer(m);
+        }}
+      }});
+      const counterEl = document.getElementById('visible-counter');
+      if (counterEl) {{
+        counterEl.textContent = visibleCount === features.length
+          ? `${{features.length}}장`
+          : `${{visibleCount}} / ${{features.length}}장`;
+      }}
+    }}
+
+    function toggleMarkersHidden() {{
+      const hidden = document.body.classList.toggle('markers-hidden');
+      const btn = document.getElementById('toggle-hide-btn');
+      if (btn) {{
+        btn.classList.toggle('active', hidden);
+        btn.textContent = hidden ? '👁 마커 다시 표시 (H)' : '👁 마커 잠시 숨기기 (H)';
+      }}
+    }}
 
     // 축척 막대 — 현장 거리 감각을 잡는 데 필요하다.
     L.control.scale({{ position: 'bottomright', imperial: false, maxWidth: 180 }}).addTo(map);
@@ -1392,23 +1769,84 @@ def write_map(records: list[dict], output_path: str,
         if (lb.style.display === 'flex') closeLightbox();
         return;
       }}
-      // 라이트박스가 떠 있을 때는 지도 탐색 키를 가로채지 않는다.
       if (lb.style.display === 'flex') return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
       if (e.key === 'ArrowLeft')  {{ e.preventDefault(); gotoPhoto(currentIndex <= 0 ? 0 : currentIndex - 1); }}
       if (e.key === 'ArrowRight') {{ e.preventDefault(); gotoPhoto(currentIndex + 1); }}
-      if (e.key === 'f' || e.key === 'F') {{ map.fitBounds(markerGroup.getBounds().pad(0.18)); }}
+      if (e.key === 'f' || e.key === 'F') {{
+        if (markerGroup.getLayers().length > 0) {{
+          map.fitBounds(markerGroup.getBounds().pad(0.18), {{ maxZoom: 19 }});
+        }}
+      }}
+      if (e.key === 'h' || e.key === 'H') {{
+        toggleMarkersHidden();
+      }}
     }});
 
-    // ── 범례 ─────────────────────────────────────────────────────────────
+    // ── 인터랙티브 범례 & 마커 가림 방지 컨트롤 ───────────────────────────
     const legend = L.control({{position:'bottomleft'}});
     legend.onAdd = () => {{
-      const d = L.DomUtil.create('div','legend');
+      const d = L.DomUtil.create('div', 'legend');
+      L.DomEvent.disableClickPropagation(d);
+      L.DomEvent.disableScrollPropagation(d);
+
+      const groupItemsHtml = folderGroups.map((g, idx) => {{
+        const isDrone = g.cam_type === 'drone';
+        const badgeSvg = isDrone
+          ? `<svg width="14" height="14" viewBox="0 0 14 14"><line x1="7" y1="12" x2="7" y2="3" stroke="${{g.color}}" stroke-width="2"/><polygon points="7,1 4,6 10,6" fill="${{g.color}}"/><circle cx="7" cy="10" r="2.2" fill="${{g.color}}"/></svg>`
+          : `<svg width="14" height="14" viewBox="0 0 14 14"><circle cx="7" cy="7" r="4" fill="${{g.color}}" stroke="#0a0f1e" stroke-width="1"/></svg>`;
+        const typeLabel = isDrone ? '드론·화살표' : 'DSLR·점';
+        return `
+          <label class="legend-item" title="${{g.folder}} (${{typeLabel}})">
+            <input type="checkbox" checked data-group-key="${{g.key}}">
+            <span class="legend-swatch">${{badgeSvg}}</span>
+            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+              <b style="color:${{g.color}}">[${{isDrone ? '드론' : 'DSLR'}}]</b> ${{g.folder}}
+            </span>
+            <span style="color:#94a3b8; font-family:monospace;">${{g.count}}</span>
+          </label>`;
+      }}).join('');
+
       d.innerHTML = `
-        <b>범례</b><br>
-        <span class="legend-dot" style="background:#e94560"></span> 경사 촬영 (화살표=바라보는 방향)<br>
-        <span class="legend-dot" style="background:#718096"></span> 방향 정보 없음<br>
-        <span style="display:inline-block; width:12px; height:12px; margin-right:6px; border:2px dashed #e94560; border-radius:50%; vertical-align:middle;"></span> 수직 촬영 (짐벌 Pitch {NADIR_PITCH_THRESHOLD:.0f}° 이하)<br>
-        <span style="font-size:0.7rem;color:#a0aec0;">* 사이드바 사진 클릭 후 마우스 휠을 굴려 확대/축소 및 드래그 이동이 가능합니다.</span>`;
+        <div class="legend-title">
+          <span>🗂 폴더별 표시 &amp; 마커 조절</span>
+        </div>
+        <div class="legend-group-list">${{groupItemsHtml}}</div>
+        <div style="font-size:0.7rem; color:#94a3b8; margin-bottom:6px; border-top:1px solid #2d3748; padding-top:5px;">
+          • <b>드론</b>: 점 + 촬영방향 화살표 (수직촬영은 점선 과녁)<br>
+          • <b>DSLR</b>: 방향 화살표 없이 폴더별 점으로만 표시
+        </div>
+        <div class="ctrl-row">
+          <span>마커 크기</span>
+          <input id="scale-slider" type="range" min="0.4" max="1.8" step="0.05" value="1.0">
+        </div>
+        <div class="ctrl-row">
+          <span>마커 투명도</span>
+          <input id="opacity-slider" type="range" min="0.15" max="1.0" step="0.05" value="0.88">
+        </div>
+        <button id="toggle-hide-btn" class="hide-btn" onclick="toggleMarkersHidden()">👁 마커 잠시 숨기기 (H)</button>
+      `;
+
+      d.querySelectorAll('input[type="checkbox"][data-group-key]').forEach(cb => {{
+        cb.addEventListener('change', (ev) => {{
+          const key = ev.target.getAttribute('data-group-key');
+          if (ev.target.checked) activeGroups.add(key);
+          else activeGroups.delete(key);
+          applyGroupFilter();
+        }});
+      }});
+
+      const scaleSlider = d.querySelector('#scale-slider');
+      scaleSlider.addEventListener('input', (ev) => {{
+        userScale = parseFloat(ev.target.value) || 1.0;
+        updateMarkerScale();
+      }});
+
+      const opacitySlider = d.querySelector('#opacity-slider');
+      opacitySlider.addEventListener('input', (ev) => {{
+        document.documentElement.style.setProperty('--marker-opacity', ev.target.value);
+      }});
+
       return d;
     }};
     legend.addTo(map);
@@ -1440,7 +1878,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
-  python archaeo_gps.py -i ./photos -o output.csv
+  python archaeo_gps.py --drone ./드론사진 --dslr ./DSLR사진 -o output.csv --map map.html
   python archaeo_gps.py -i ./photos -o output.csv --crs tm --map map.html
   python archaeo_gps.py -i . -o out.csv --crs tm_old --exiftool ./exiftool.exe
 
@@ -1471,8 +1909,12 @@ def build_parser() -> argparse.ArgumentParser:
   또는 EPSG 코드 직접 입력: epsg:5186, epsg:32652, …
         """,
     )
-    parser.add_argument("-i", "--input",
-                        help="입력 폴더 또는 이미지 파일 경로")
+    parser.add_argument("-i", "--input", action="append", default=[],
+                        help="입력 폴더 또는 이미지 파일 경로 (드론/DSLR 자동 판별, 여러 번 지정 가능)")
+    parser.add_argument("--drone", action="append", default=[],
+                        help="드론 사진 폴더 또는 파일 경로 (지도에 점 + 촬영방향 화살표 표시)")
+    parser.add_argument("--dslr", action="append", default=[],
+                        help="DSLR/일반 카메라 사진 폴더 또는 파일 경로 (지도에 화살표 없이 점만 표시)")
     parser.add_argument("-o", "--output",
                         help="출력 CSV 파일 경로 (예: output.csv)")
     parser.add_argument("--crs", default="tm",
@@ -1510,12 +1952,11 @@ def main():
         print("\n  또는 EPSG 코드 직접 입력: epsg:5186, epsg:32652, …")
         return
 
-    if not args.input or not args.output:
-        parser.error("-i/--input 과 -o/--output 은 필수입니다. (목록만 보려면 --list-crs)")
+    has_inputs = bool(args.input or args.drone or args.dslr)
+    if not has_inputs or not args.output:
+        parser.error("입력 경로(-i/--input, --drone, --dslr 중 하나 이상)와 -o/--output 은 필수입니다. (목록만 보려면 --list-crs)")
 
     # ── 의존성 경고 ──────────────────────────────────────────────────────────
-    if not HAS_PANDAS:
-        print("ℹ️  pandas 미설치 → csv 모듈로 대체 출력합니다. (pip install pandas)")
     if not HAS_PYPROJ and not args.no_transform:
         print("⚠️  pyproj 미설치 → 좌표 변환이 비활성화됩니다. (pip install pyproj)")
     if args.map and not HAS_PILLOW and args.thumb_size > 0:
@@ -1529,16 +1970,22 @@ def main():
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
-    # ── 이미지 목록 ──────────────────────────────────────────────────────────
+    # ── 이미지 목록 (드론 / DSLR / 일반 구분 수집) ──────────────────────────
     try:
-        images = collect_images(args.input, recursive=args.recursive)
+        images, meta_by_path = collect_grouped_images(
+            drone_inputs=args.drone,
+            dslr_inputs=args.dslr,
+            generic_inputs=args.input,
+            recursive=args.recursive,
+        )
     except FileNotFoundError as e:
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
     if not images:
         scope = "하위 폴더 포함" if args.recursive else "하위 폴더 미포함 (-r 로 재귀 탐색)"
-        print(f"⚠️  지원 이미지 파일이 없습니다: {args.input}  [{scope}]", file=sys.stderr)
+        all_inputs = ", ".join(args.drone + args.dslr + args.input)
+        print(f"⚠️  지원 이미지 파일이 없습니다: {all_inputs}  [{scope}]", file=sys.stderr)
         sys.exit(1)
 
     print(f"📂 이미지 {len(images)}장 발견")
@@ -1554,10 +2001,29 @@ def main():
         print("❌ EXIF 데이터를 추출하지 못했습니다.", file=sys.stderr)
         sys.exit(1)
 
-    records = [parse_record(r) for r in raw_records]
+    records = []
+    for r in raw_records:
+        sf = r.get("SourceFile", "")
+        meta = meta_by_path.get(sf, {})
+        records.append(
+            parse_record(
+                r,
+                camera_type=meta.get("camera_type"),
+                folder_label=meta.get("folder"),
+            )
+        )
+
     gps_ok = sum(1 for r in records if r["Lat_DD"] is not None)
-    dir_ok = sum(1 for r in records if r["CamDirection_deg"] is not None)
-    print(f"   GPS 있음: {gps_ok}/{len(records)}장  |  방향 있음: {dir_ok}/{len(records)}장")
+    drone_cnt = sum(1 for r in records if r.get("CameraType") == CAMERA_TYPE_DRONE)
+    dslr_cnt = sum(1 for r in records if r.get("CameraType") == CAMERA_TYPE_DSLR)
+    dir_ok = sum(
+        1 for r in records
+        if r.get("CameraType") == CAMERA_TYPE_DRONE and r["CamDirection_deg"] is not None
+    )
+    print(
+        f"   GPS 있음: {gps_ok}/{len(records)}장  |  "
+        f"드론: {drone_cnt}장 (방향 {dir_ok}장)  |  DSLR: {dslr_cnt}장"
+    )
     if gps_ok == 0:
         print("⚠️  GPS 좌표가 있는 사진이 없습니다. 좌표 변환과 지도 생성은 생략됩니다.",
               file=sys.stderr)
@@ -1591,7 +2057,8 @@ def main():
         thumb_size = max(0, args.thumb_size)
         write_map(records, args.map,
                   thumb_size=thumb_size if thumb_size > 0 else 0,
-                  progress=_cli_thumb_progress if thumb_size > 0 else None)
+                  progress=_cli_thumb_progress if thumb_size > 0 else None,
+                  exiftool_path=exiftool_path)
 
     # ── 요약 출력 ────────────────────────────────────────────────────────────
     _print_summary(records)
@@ -1606,24 +2073,38 @@ def _cli_thumb_progress(done: int, total: int) -> None:
     print(f"\r🖼️  썸네일 생성 중… {done}/{total} ({pct}%)", end=end, flush=True)
 
 
+MAX_SUMMARY_ROWS = 50
+
+
 def _print_summary(records: list[dict]) -> None:
     """추출 결과 요약 표를 출력한다."""
-    # 파일명 열 너비를 실제 데이터에 맞춰 잡는다 (긴 드론 파일명이 잘리지 않도록).
     name_w = max([len(str(r.get("FileName", ""))) for r in records] + [8])
-    name_w = min(name_w, 40)
-    line = "─" * (name_w + 45)
+    name_w = min(name_w, 34)
+    grp_w = 18
+    line = "─" * (name_w + grp_w + 46)
 
     print()
     print(line)
-    print(f"{'파일명':<{name_w}} {'방향(°)':>8} {'방위':>5} {'위도':>12} {'경도':>13}")
+    print(f"{'파일명':<{name_w}} {'구분/폴더':<{grp_w}} {'방향(°)':>8} {'방위':>5} {'위도':>12} {'경도':>13}")
     print(line)
-    for r in records:
+    shown = records[:MAX_SUMMARY_ROWS]
+    for r in shown:
         lat_s = f"{r['Lat_DD']:.6f}" if r["Lat_DD"] is not None else "N/A"
         lon_s = f"{r['Lon_DD']:.6f}" if r["Lon_DD"] is not None else "N/A"
-        dir_s = f"{r['CamDirection_deg']:.1f}" if r["CamDirection_deg"] is not None else "N/A"
-        card = r.get("CamDirection_cardinal", "") or "-"
+        is_drone = r.get("CameraType") == CAMERA_TYPE_DRONE
+        dir_s = (
+            f"{r['CamDirection_deg']:.1f}"
+            if (is_drone and r.get("CamDirection_deg") is not None)
+            else "-"
+        )
+        card = (r.get("CamDirection_cardinal", "") or "-") if is_drone else "-"
+        cam_lbl = "드론" if is_drone else "DSLR"
+        folder_lbl = str(r.get("Folder", "기본"))
+        grp_s = f"{cam_lbl}:{folder_lbl}"[:grp_w]
         name = str(r.get("FileName", ""))[:name_w]
-        print(f"{name:<{name_w}} {dir_s:>8} {card:>5} {lat_s:>12} {lon_s:>13}")
+        print(f"{name:<{name_w}} {grp_s:<{grp_w}} {dir_s:>8} {card:>5} {lat_s:>12} {lon_s:>13}")
+    if len(records) > MAX_SUMMARY_ROWS:
+        print(f"  … 외 {len(records) - MAX_SUMMARY_ROWS}개 레코드 (전체 내용은 CSV 참조)")
     print(line)
 
 
