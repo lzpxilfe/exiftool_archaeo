@@ -1,0 +1,2 @@
+# Preserve BAT bytes (CRLF) in both Git checkouts and ZIP downloads.
+*.bat -text

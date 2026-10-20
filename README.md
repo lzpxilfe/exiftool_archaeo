@@ -55,45 +55,86 @@ ExifTool 호출은 기본 **500장 단위**로 나눕니다. 한 배치가 실�
 
 파일 경로의 개행문자가 ExifTool 옵션으로 해석되는 것을 차단합니다. HTML에는 폴더명 대신 내부 그룹 ID를 사용하고, 스크립트 삽입을 방지하도록 JSON을 직렬화합니다. GeoJSON에는 비표준 `NaN`·`Infinity` 숫자를 출력하지 않습니다.
 
-## 설치와 실행
+## Windows: BAT 한 번으로 EXE 만들기
 
-Python **3.10 이상**과 별도의 ExifTool 실행 파일이 필요합니다.
+**`build_windows.bat`를 더블클릭하면 ExifTool 엔진까지 포함한 `dist/ExifToolArchaeo.exe`를 만듭니다.**
+완성된 EXE를 실행할 때는 Python 설치, 별도의 `exiftool.exe` 복사, 환경 변수 설정이 필요하지 않습니다.
+
+1. 이 저장소 전체를 내려받아 **압축을 푼 폴더**를 사용합니다. Git으로 받았다면 `git pull`로 갱신합니다.
+2. **`build_windows.bat`를 더블클릭**합니다. BAT 파일만 따로 옮기지 마세요.
+3. `SUCCESS`가 표시되면 **`dist/ExifToolArchaeo.exe`**를 실행합니다. 기존 EXE가 열려 있으면 닫고 빌드하세요.
+
+**빌드하는 PC의 준비물:** Windows 10/11 x64, 64비트 x86 Python **3.10 이상**(pip·Tcl/Tk 포함), 인터넷 연결.
+Python은 [공식 설치 프로그램](https://www.python.org/downloads/windows/)으로 한 번 설치하면 됩니다.
+BAT는 `py -3` 또는 `python`을 확인하고, 적합한 Python이 없으면 안내 후 종료합니다.
+Python을 몰래 설치하거나 시스템 PATH를 변경하지 않으며, 관리자 권한도 요구하지 않습니다.
+**Windows EXE 빌드는 Windows에서 실행해야 합니다.**
+
+### BAT가 자동으로 처리하는 것
+
+- 프로젝트 안에 전용 **`.venv-build`** 환경을 만들고 Python 의존성·PyInstaller를 설치합니다. 전역 Python 패키지는 건드리지 않습니다.
+- 공식 SourceForge 배포처에서 **ExifTool 13.59 64비트 ZIP**을 내려받고, 고정된 **SHA-256 체크섬**을 확인합니다. HTML 오류 페이지나 변조된 ZIP은 실행하지 않습니다.
+- `exiftool(-k).exe`를 `exiftool.exe`로 바꾸고 **`exiftool_files` 폴더와 배포판 안내문을 통째로** EXE에 포함합니다. 사용자가 엔진을 따로 구할 필요가 없습니다.
+- 기존 앱 테스트와 새 패키징 테스트를 실행한 뒤 최신 PyInstaller 6.x 스펙 형식으로 빌드합니다.
+- **EXE만 별도의 한글·공백 경로로 복사**하고, 외부 ExifTool 경로 설정을 제거한 상태에서 자동 검사합니다. 엔진 실행, 합성 JPEG의 GPS 읽기, 좌표 변환, 썸네일, CSV·GeoJSON·HTML 생성을 검사하며 **통과한 EXE만** `dist`로 옮깁니다.
+
+자동 검사는 임시로 만든 합성 사진만 사용합니다. 실제 조사 사진의 EXIF는 수정하지 않습니다.
+엔진은 재현 가능한 빌드를 위해 버전과 해시를 함께 고정했습니다. 임의의 최신 버전으로 자동 교체하지 않습니다.
+출처와 체크섬은 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)에 기록되어 있습니다.
+
+```text
+프로젝트 폴더/
+  build_windows.bat           ← 이것을 실행
+  .venv-build/                ← 빌드용 Python 환경 (자동 생성)
+  .build-cache/               ← 검증한 ZIP·런타임·로그 (자동 생성)
+    build_windows.log        ← 실패 원인 확인용 전체 로그
+    self-test.json           ← 완성 EXE의 자동 검사 결과
+  dist/
+    ExifToolArchaeo.exe       ← 엔진이 내장된 실행 파일
+    THIRD_PARTY_NOTICES.md    ← 배포 시 보존할 외부 구성 요소 안내
+```
+
+`exiftool.exe`·`exiftool_files`를 EXE 옆에 따로 둘 필요는 없습니다. EXE는 실행 시 내부 구성 요소를 임시 폴더에 풀어 사용합니다.
+명시적으로 지정한 `EXIFTOOL_PATH`나 CLI의 `--exiftool`은 계속 사용할 수 있으나, 일반 사용자는 지정하지 않아도 됩니다.
+이전에 잘못 설정한 환경 변수가 있다면 제거하고 내장 엔진을 사용하세요.
+
+### 빌드에 실패했을 때
+
+성공으로 표시하지 않고 창을 유지하며 **`.build-cache/build_windows.log`**에 전체 오류를 남깁니다.
+최종 자동 검사가 실패하면 기존 `dist/ExifToolArchaeo.exe`를 덮어쓰지 않습니다.
+검사 보고서가 생성된 경우 `.build-cache/self-test.json`에도 원인이 남습니다.
+
+네트워크가 공식 다운로드를 차단하는 경우에만 공식 `exiftool-13.59_64.zip`을 `.build-cache`에 넣고 다시 실행하세요.
+캐시 ZIP도 같은 해시 검사를 거치며, 해시가 다르면 중단합니다. 손상된 ZIP은 해당 파일만 삭제하고 재실행하세요.
+회사 PC 보안 정책이나 백신이 실행 파일을 차단하는 경우에는 보안 기능을 끄지 말고 관리자에게 확인하세요.
+
+명령줄에서 종료 대기를 생략하려면 `build_windows.bat --no-pause`를 사용합니다.
+
+### Python 소스로 직접 실행 (개발자·macOS·Linux)
+
+소스 실행에는 Python **3.10 이상**과 별도 ExifTool이 필요합니다. 위의 Windows BAT로 만든 EXE와는 다른 실행 방식입니다.
 
 ```bash
 git clone https://github.com/lzpxilfe/exiftool_archaeo.git
 cd exiftool_archaeo
 pip install -r requirements.txt
-
-# GUI
 python archaeo_gps_gui.py
 ```
 
-`pyproj`는 좌표 변환에, `Pillow`는 썸네일 생성에 사용합니다. ExifTool은 [공식 사이트](https://exiftool.org/)에서 준비하세요. 실행 파일 옆에 배치하거나 `EXIFTOOL_PATH` 또는 CLI의 `--exiftool`로 지정할 수 있습니다.
+`pyproj`는 좌표 변환, `Pillow`는 썸네일 생성에 사용합니다. 소스 실행용 ExifTool은
+[공식 배포처](https://exiftool.sourceforge.net/)에서 준비하고 `EXIFTOOL_PATH` 또는 CLI의 `--exiftool`로 지정합니다.
+Windows 분리형 엔진을 직접 사용할 때는 `exiftool.exe`와 `exiftool_files`를 함께 보관해야 합니다.
 
 ```powershell
-# PowerShell: ExifTool 경로 지정
+# 소스 실행 시에만 필요한 예시
 $env:EXIFTOOL_PATH = 'D:\tools\exiftool\exiftool.exe'
+python archaeo_gps_gui.py
 ```
 
 ```bash
-# macOS / Linux: ExifTool 경로 지정
+# macOS / Linux 소스 실행
 export EXIFTOOL_PATH=/usr/local/bin/exiftool
-```
-
-### Windows 실행 파일 빌드
-
-```bash
-pip install pyinstaller
-pyinstaller archaeo_gps.spec --clean
-```
-
-`dist/ExifToolArchaeo.exe`와 ExifTool 구성 요소를 함께 배치합니다. 분리형 Windows 배포판은 `exiftool.exe`만 복사하지 말고 `exiftool_files` 폴더도 함께 보관하세요.
-
-```text
-작업 폴더/
-  ExifToolArchaeo.exe
-  exiftool.exe
-  exiftool_files/
+python archaeo_gps_gui.py
 ```
 
 ## CLI 사용 예시
@@ -144,13 +185,13 @@ HTML의 지도 타일과 Leaflet 라이브러리는 외부 서버에서 가져�
 ## 테스트
 
 ```bash
-# 기존 테스트 + 품질·배치·출력 회귀 테스트
-python -m unittest discover -p "test_archaeo*.py" -v
+# 기존 앱 테스트 + 패키징·다운로드·런타임 회귀 테스트
+python -m unittest discover -p "test_*.py" -v
 ```
 
 ExifTool 실행 파일이나 실사 사진 없이 수행할 수 있습니다. 배치 호출은 모의 프로세스로 검증하며, `pyproj`가 있으면 실제 좌표 변환 왕복 테스트도 실행합니다. Node.js가 있으면 생성된 지도 JavaScript 문법과 DSLR 방향 토글의 아이콘 동작도 확인합니다. 선택 도구가 없는 경우 해당 테스트는 건너뜁니다.
 
-실제 D5600·DJI 사진, Windows 실행 파일, 현장 GPS 오차, 외부 지도 타일은 별도의 통합 검증 대상입니다. **GPX 기반 사후 위치 보완, 자북 편각 보정, 자동 실패 재시도는 이번 버전에 포함되지 않습니다.**
+새 패키징 단위 테스트는 네트워크·실제 Windows 엔진 없이 실행합니다. 실제 EXE 자동 검사는 Windows에서 BAT를 실행할 때 별도로 수행합니다. 실제 D5600·DJI 사진, 현장 GPS 오차, 외부 지도 타일 및 GUI 조작은 별도의 통합 검증 대상입니다. **GPX 기반 사후 위치 보완, 자북 편각 보정, 자동 실패 재시도는 이번 버전에 포함되지 않습니다.**
 
 ## 라이선스
 
