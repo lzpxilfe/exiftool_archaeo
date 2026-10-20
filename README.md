@@ -1,175 +1,157 @@
 # 🏛️ ExifTool Archaeo
 
-드론(DJI) 및 DSLR 카메라로 촬영한 현장 사진에서 **GPS 좌표**와 **촬영 방향(방위각)**을 추출하여, 고고학 조사의 정밀한 분석을 돕고 **GIS 호환 데이터** 및 **대화형 HTML 지도**로 자동 시각화해 주는 현장 친화형 분석 도구입니다.
+드론·DSLR 현장 사진의 EXIF에서 촬영 위치와 방향 메타데이터를 읽고, CSV·GeoJSON·대화형 HTML 지도로 정리하는 고고학 조사 보조 도구입니다.
 
-특히 **산림 지형**이나 광범위한 고분군 조사에서 사진만 보고 촬영 방향을 가늠하기 어려울 때, 드론에 정밀하게 기록된 짐벌 방위각(`GimbalYawDegree`)을 완벽하게 파싱하여 16방위 나침반 방향(`N/NE/SE...`)과 함께 나타냅니다.
+**v1.3.0 — 좌표 검증, 방향 출처 구분, 분할 추출 및 안전한 지도 출력**
 
----
+> 지도에 표시되는 좌표는 카메라에 기록된 **촬영 위치**이며, 사진 속 유구·유물의 위치가 아닙니다. 좌표의 소수 자릿수와 실제 측정 정확도는 별개입니다. 사진을 원래 장비에서 촬영한 상태 그대로 보관하고, 조사 도면에 적용하기 전에 위치·시각·좌표계를 확인하세요.
 
-## 🌟 주요 핵심 기능
+## 주요 기능
 
-*   **⚡ 초고속·초정밀 EXIF 일괄 파싱**: `ExifTool` 배치 아규먼트 파일 전달 방식(`-@`)과 `-c "%d deg %d' %.6f\""` 포맷을 채택하여 RTK 드론의 **서브밀리미터(~0.03mm)급 좌표 정밀도**를 손실 없이 보존하며 수백 장의 사진 정보를 단 1~2초 만에 일괄 추출합니다.
-*   **🛩️📷 드론 / DSLR 분리 입력 및 맞춤형 심볼**:
-    *   **드론 사진 폴더 (`--drone`)**: 지도에 **점 + 촬영방향 화살표**(수직 촬영 `Gimbal Pitch <= -85°` 은 점선 과녁)로 표시하여 어느 방향을 바라보고 찍었는지 직관적으로 보여줍니다.
-    *   **DSLR 사진 폴더 (`--dslr`)**: 방향 화살표 없이 **깔끔한 소형 점(원·마름모·사각형·삼각형)**으로만 표시하여 발굴 구덩이·유구 주변 밀집 촬영 시 화살표가 엉켜 지도를 가리는 문제를 방지합니다.
-*   **🎨 입력 폴더별 색상·도형 자동 구분 & ON/OFF 필터**: 여러 폴더(또는 `-r` 하위 폴더)를 입력하면 폴더마다 서로 다른 고대비 색상과 심볼이 자동 배정되며, 지도 좌측 하단 범례에서 폴더별로 체크박스를 켜고 끌 수 있습니다.
-*   **👁️ 밀집 구역 지도 가림 방지 컨트롤**:
-    *   불필요한 외곽 원형 테두리를 제거하여 마커 면적을 대폭 축소하고, 줌 레벨에 따라 마커 크기가 자동 조절됩니다.
-    *   지도 좌측 하단 컨트롤에서 **마커 크기 슬라이더(40%~180%)**, **마커 투명도 슬라이더(15%~100%)**를 실시간 조절할 수 있으며, **`H` 단축키(또는 버튼)**로 마커를 잠시 숨겨 바닥의 유구·위성지도를 깔끔하게 확인할 수 있습니다.
-*   **🛣️ 윈도우 한글/공백 경로명 완벽 극복**: 윈도우 탐색기 특유의 한글 폴더 자모 결함(NFC/NFD 불일치) 및 공백이 포함된 파일 경로에서도 에러가 나지 않도록, 스레드 안전한 8.3 단축 경로 변환 필터(`get_short_path_name`) 및 RAW/HEIC 내장 프리뷰 추출 폴백을 내장했습니다.
-*   **🗺️ Leaflet.js 기반 대화형 고고학 지도**:
-    *   **멀티 타일 레이어**: Esri 위성지도, OSM 기본지도 및 국토교통부 공식 **브이월드(Vworld) 지도(위성/하이브리드/기본)**를 독립 타일 인스턴스로 연동하여 빈 화면 없이 원클릭 전환 가능합니다.
-    *   **실시간 base64 썸네일 팝업 & 라이트박스 휠 줌**: 마커를 클릭하면 우측 사이드바와 라이트박스에서 사진을 **마우스 휠로 자유롭게 확대/축소**하고 **드래그로 이동**하며 정밀 유구를 판독할 수 있습니다.
-    *   **⌨️ 키보드 단축키**: `←` / `→` 로 사진을 순서대로 넘겨보고, `F` 로 전체 지점 맞춤, `H` 로 마커 잠시 숨기기/보이기, `Esc` 로 확대창을 닫습니다.
-*   **📡 국가지리정보 호환 좌표계(TM) 변환**: GPS 위경도(WGS84) 데이터를 한국 공식 투영계(`TM중부원점`, `UTM-K`, `구 Bessel 원점` 등)로 정밀 변환해 CSV로 저장합니다.
-*   **🌍 GeoJSON 내보내기**: `--geojson` 옵션(또는 GUI 체크박스)으로 QGIS·ArcGIS에서 바로 열리는 GeoJSON을 함께 저장합니다.
+- JPG·TIFF·HEIC 및 Nikon NEF, DJI DNG 등 지원 확장자의 EXIF 일괄 추출. RAW·HEIC 썸네일은 Pillow에서 열지 못할 때 ExifTool 내장 프리뷰로 대체합니다.
+- 드론·DSLR 폴더를 분리 입력하고, 여러 폴더·하위 폴더를 색상과 도형으로 구분합니다.
+- WGS84 위치를 대상 좌표계로 변환하여 UTF-8 BOM CSV에 저장합니다. GeoJSON은 WGS84 `[경도, 위도]` 순서입니다.
+- Leaflet HTML 지도에서 위성·일반 지도 전환, 폴더 필터, 사진 사이드바, 썸네일 확대, 마커 크기·투명도 조절을 지원합니다.
+- 사진 원본의 EXIF는 **읽기만** 합니다. GPS가 없는 사진에 좌표를 임의로 만들어 넣지 않습니다.
 
----
+## v1.3.0 변경 사항
 
-## 💻 윈도우 무설치 실행 파일 (.exe) 직접 만드는 방법
+### 1. 위치 품질 검증
 
-> ⚠️ **알림**: GitHub는 파일당 용량 제한 및 서명 보안 이슈로 인해 컴파일된 큰 단독 실행 파일(`.exe`)을 리포지토리에 직접 제공하지 않습니다.
-> 하지만 아래의 가이드를 따라 몇 줄의 명령어 입력만으로 사용자의 PC에서 직접 최신 무설치 실행 파일을 안전하게 빌드하고 사용할 수 있습니다!
+위도 `-90~90`, 경도 `-180~180`, 유한 숫자 여부, 도분초 형식, 분·초 범위, 반구 표기의 모순을 확인합니다. `NaN`, 무한대, 위도만 있는 사진, 잘못된 DMS를 정상 위치로 취급하지 않습니다.
 
-### 1단계: 준비 단계 🛠️
-1. PC에 **Python**([공식 홈페이지 다운로드](https://www.python.org/downloads/))이 설치되어 있어야 합니다. (설치 시 **`Add Python to PATH`** 옵션을 꼭 체크하세요!)
-2. 리포지토리를 ZIP 파일로 다운로드하여 압축을 풀거나, Git 명령어로 클론합니다:
-   ```bash
-   git clone https://github.com/lzpxilfe/exiftool_archaeo.git
-   cd exiftool_archaeo
-   ```
+| `GPSValidation` | 의미 | 지도·GeoJSON |
+| --- | --- | --- |
+| `valid` | 좌표 형식·범위 검사를 통과함. 측정 정확도를 보장하지 않음 | 포함 |
+| `missing` | 위도·경도 모두 없음 | 제외 |
+| `incomplete` | 위도 또는 경도 누락 | 제외 |
+| `invalid` | 형식·범위·반구 모순 또는 GPS 측정 무효 상태 | 제외 |
 
-### 2단계: 필수 패키지 설치 📦
-명령 프롬프트(cmd) 또는 PowerShell을 열어 라이브러리와 빌더인 PyInstaller를 설치합니다:
+문제 있는 사진도 **CSV 행은 유지**하며 `GPSLatitude_raw`, `GPSLongitude_raw`, 반구 원본값과 `GPSWarnings`를 남깁니다. `(0, 0)`은 실제 존재하는 좌표이므로 삭제하지 않고 별도 확인 경고를 붙입니다.
+
+기록되어 있는 경우에만 `GPSHPositioningError_m`, `GPSDOP`, `GPSStatus`, GPS 날짜·시각, `OffsetTimeOriginal`, `GPSProcessingMethod` 등을 보존합니다. DOP는 미터 단위 위치오차가 아니며, `GPSPositionSource=EXIF`는 읽어 온 메타데이터 경로를 뜻할 뿐 스마트폰·외장 수신기·RTK 여부를 판정한 결과가 아닙니다.
+
+추출 단계에서는 DMS 초 소수점 6자리를 사용하고, 읽은 좌표를 출력 전에 소수점 8자리로 추가 반올림하지 않습니다. 이 처리는 **숫자 표현 손실을 줄이는 것**이지 GPS 정확도를 높이는 것이 아닙니다. 기존의 “0.03 mm급 측정 정확도”로 오해될 수 있는 표현과 고정 처리시간 주장은 제거했습니다.
+
+### 2. 촬영 방향과 기체 방향 구분
+
+카메라 방향의 선택 순서는 **`GimbalYawDegree` → `GPSImgDirection`**입니다. `FlightYawDegree`는 `FlightYaw`로 별도 보존하지만 카메라 방향으로 대체하지 않습니다. 기체 Yaw만 있는 사진에는 촬영 방향 화살표를 만들지 않습니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `CamDirectionSource` | 선택한 원본 태그. `GimbalYawDegree`, `GPSImgDirection` 또는 빈 값 |
+| `CamDirectionReference` | `T`: 진북, `M`: 자북, `U`: 북 기준 미확인 |
+| `CamDirectionWarnings` | 기체 방향만 존재함, 북 기준 미확인, 자북 미보정 등의 경고 |
+
+짐벌 Yaw 태그만으로 북 기준을 확정하지 않으므로 `U`로 표시합니다. 진북은 일반 화살표, 북 기준 미확인은 점선 화살표로 구분합니다. **자북은 편각을 보정하지 않고 진북 지도에 바로 그리지 않으며**, 원래 방향값과 경고는 결과에 보존합니다. 수직 촬영은 기존 과녁 표시를 유지합니다.
+
+DSLR은 기존처럼 **점 표시가 기본**입니다. 생성된 지도의 왼쪽 아래 **“DSLR 방향 표시”**를 선택하면 사용 가능한 방향 메타데이터가 있는 사진만 화살표로 전환합니다. 위치정보만 들어 있는 D5600 사진에 촬영 방향을 추정해서 붙이지 않습니다.
+
+### 3. 대량 처리 및 출력 안정성
+
+ExifTool 호출은 기본 **500장 단위**로 나눕니다. 한 배치가 실패해도 앞서 읽은 결과를 버리지 않고 다음 배치를 처리하며, 실패 배치 번호와 ExifTool 경고를 전달합니다. 성공 종료 코드에 포함된 경고와 개별 파일의 `Error`도 보존합니다.
+
+이는 ExifTool JSON의 일회성 처리 크기를 제한하는 개선입니다. 최종 레코드·썸네일·HTML 전체를 완전히 스트리밍하거나 디스크에 중간 저장하는 구조는 아니므로, 아주 큰 조사 자료는 폴더별로 나누고 `--thumb-size 0`도 활용하세요. 자동 재시도·재개 기능은 포함하지 않습니다.
+
+파일 경로의 개행문자가 ExifTool 옵션으로 해석되는 것을 차단합니다. HTML에는 폴더명 대신 내부 그룹 ID를 사용하고, 스크립트 삽입을 방지하도록 JSON을 직렬화합니다. GeoJSON에는 비표준 `NaN`·`Infinity` 숫자를 출력하지 않습니다.
+
+## 설치와 실행
+
+Python **3.10 이상**과 별도의 ExifTool 실행 파일이 필요합니다.
+
 ```bash
-pip install pyproj Pillow pyinstaller
+git clone https://github.com/lzpxilfe/exiftool_archaeo.git
+cd exiftool_archaeo
+pip install -r requirements.txt
+
+# GUI
+python archaeo_gps_gui.py
 ```
 
-### 3단계: ExifTool 코어 구성 📡
-1. [ExifTool 공식 홈페이지](https://exiftool.org/)에 접속합니다.
-2. 최신 Windows Executable 버전 (예: `exiftool-XX.XX.zip`)을 다운로드합니다.
-3. 압축을 해제하여 `exiftool(-k).exe` 파일을 얻은 뒤, 파일 이름을 **`exiftool.exe`**로 변경합니다.
-4. 이 `exiftool.exe` 파일을 프로젝트 내 **`dist`** 폴더(없다면 폴더 생성) 또는 프로젝트 루트 폴더에 넣어둡니다.
-   * *자세한 작동을 위해 `exiftool.exe`와 `exiftool_files` 디렉토리가 함께 구성되어 있어야 합니다.*
+`pyproj`는 좌표 변환에, `Pillow`는 썸네일 생성에 사용합니다. ExifTool은 [공식 사이트](https://exiftool.org/)에서 준비하세요. 실행 파일 옆에 배치하거나 `EXIFTOOL_PATH` 또는 CLI의 `--exiftool`로 지정할 수 있습니다.
 
-### 4단계: 실행 파일(.exe) 빌드 실행 ⚙️
-프로젝트 루트 디렉토리에서 PyInstaller 빌드 명령을 내립니다:
+```powershell
+# PowerShell: ExifTool 경로 지정
+$env:EXIFTOOL_PATH = 'D:\tools\exiftool\exiftool.exe'
+```
+
 ```bash
+# macOS / Linux: ExifTool 경로 지정
+export EXIFTOOL_PATH=/usr/local/bin/exiftool
+```
+
+### Windows 실행 파일 빌드
+
+```bash
+pip install pyinstaller
 pyinstaller archaeo_gps.spec --clean
 ```
-빌드 프로세스가 종료되면 **`dist/`** 폴더 아래에 단독형 무설치 프로그램인 **`ExifToolArchaeo.exe`**가 탄생합니다!
 
----
-
-## 📂 최종 실행 환경 디렉토리 구조
-프로그램을 실행하려면 다음과 같이 빌드된 `ExifToolArchaeo.exe`와 ExifTool 구성 요소를 배치한 뒤 구동하면 됩니다:
+`dist/ExifToolArchaeo.exe`와 ExifTool 구성 요소를 함께 배치합니다. 분리형 Windows 배포판은 `exiftool.exe`만 복사하지 말고 `exiftool_files` 폴더도 함께 보관하세요.
 
 ```text
-바탕화면 혹은 작업 폴더/
-  ├── ExifToolArchaeo.exe   # 👈 더블클릭하여 실행하는 메인 앱!
-  ├── exiftool.exe          # 👈 ExifTool 엔진 실행 파일
-  └── exiftool_files/       # 👈 ExifTool 라이브러리 폴더 (perl5*.dll 등 포함)
+작업 폴더/
+  ExifToolArchaeo.exe
+  exiftool.exe
+  exiftool_files/
 ```
-> 💡 **Tip**: `ExifToolArchaeo.exe`는 실행 시 자신의 CWD(작업 디렉토리) 및 같은 경로 상에 유효한 `exiftool.exe` 세트가 존재하는지 자가 검증을 진행하므로, 반드시 한 폴더에 함께 묶어 보관하십시오.
->
-> 📌 **exiftool을 다른 곳에 두고 싶다면**: 환경 변수 **`EXIFTOOL_PATH`** 에 `exiftool.exe` 파일 경로(또는 그 파일이 든 폴더 경로)를 지정하면 됩니다. CLI에서는 `--exiftool` 옵션으로도 직접 전달할 수 있습니다.
-> ```bash
-> set EXIFTOOL_PATH=D:\tools\exiftool\exiftool.exe   # Windows
-> export EXIFTOOL_PATH=/usr/local/bin/exiftool          # macOS / Linux
-> ```
 
----
+## CLI 사용 예시
 
-## 🗺️ 지원 투영 좌표계 (CRS) 목록
-
-> ⚠️ **CAD / 광파기(토탈스테이션) 입력 시 좌표축 안내**
-> 출력 CSV의 투영 좌표는 GIS 표준(`always_xy=True`)을 따릅니다:
-> * **`Proj_X`** = **동향 좌표 (Easting, $E$)**
-> * **`Proj_Y`** = **북향 좌표 (Northing, $N$)**
->
-> 국내 측량법(평면직각좌표계 $X=$ 북향, $Y=$ 동향) 기준의 도면·광파기에 입력할 때는 `Proj_Y`(북향)와 `Proj_X`(동향) 열 순서를 확인하여 입력하시기 바랍니다.
-
-### 🇰🇷 대한민국 현행 표준 좌표계 (GRS80 타원체)
-
-| 코드 | EPSG | 좌표계 원점 이름 | 주 사용 지역 및 설명 |
-| :--- | :--- | :--- | :--- |
-| **`tm`** ⭐ | **5186** | **TM 중부원점 (GRS80)** | **대한민국 내륙 지형도 표준 (기본값)** |
-| `tm_west` | 5185 | TM 서부원점 (GRS80) | 인천, 전라남도·북부 서해안 지역 |
-| `tm_east` | 5187 | TM 동부원점 (GRS80) | 경상남·북도 동해안, 영남 동부 |
-| `tm_eastsea`| 5188 | TM 동해원점 (GRS80) | 울릉도, 독도 관측 영역 |
-| `utmk` | 5179 | UTM-K 단일좌표계 | 국토교통부 표준 전국 단일 투영계 |
-
-### 📜 구 국가지리정보 좌표계 (Bessel 1841 타원체, 예전 문화재 도면 및 지형도)
-
-| 코드 | EPSG | 좌표계 원점 이름 |
-| :--- | :--- | :--- |
-| `tm_old` | 5174 | 구TM 중부원점 (Bessel) |
-| `tm_old_west`| 5173 | 구TM 서부원점 (Bessel) |
-| `tm_old_east`| 5176 | 구TM 동부원점 (Bessel) |
-| `tm_mod` | 5181 | 수정 중부원점 (Bessel 2010년 한시규격) |
-
----
-
-## 🚀 사용 가이드
-
-### 1. GUI 그래픽 인터페이스 사용법
-`ExifToolArchaeo.exe`를 실행하면 설정 창이 뜹니다.
-
-1. **드론 사진 폴더 (화살표)**: 드론 사진 폴더를 선택합니다 (`+추가` 버튼으로 여러 폴더 등록 가능). 지도에 **점 + 촬영방향 화살표**로 표시됩니다.
-2. **DSLR 사진 폴더 (점만)**: DSLR/일반 카메라 사진 폴더를 선택합니다. 지도에 **방향 화살표 없이 깔끔한 점**으로만 표시됩니다. (드론/DSLR 중 하나만 넣거나 둘 다 동시에 넣을 수 있습니다.)
-3. **출력 CSV**: 변환된 측량 좌표가 작성될 엑셀 호환 CSV 파일의 경로를 설정합니다.
-4. **좌표계 선택**: 대상 현장의 도면 규격에 맞는 좌표계(예: GRS80 TM중부원점)를 고릅니다.
-5. **지도 생성**: 체크박스를 활성화하면 HTML 입체 지도를 자동 생성합니다.
-6. **추출 실행**: 버튼을 클릭하면 실시간 변환 통계와 함께 완료 보고가 나타납니다.
-
-### 2. CLI 명령줄 실행법
-서버나 자동화 배치 스크립트에서 명령어로 돌릴 수 있습니다:
 ```bash
-# 드론 폴더(점+화살표)와 DSLR 폴더(점만)를 각각 분리 입력하여 한 번에 지도·CSV 생성
-ExifToolArchaeo.exe --drone D:\조사\드론_1구역 --drone D:\조사\드론_2구역 --dslr D:\조사\DSLR_유구 -o D:\조사\결과.csv --map D:\조사\현장위치도.html
+# 드론과 DSLR 폴더를 함께 처리
+python archaeo_gps.py --drone "D:\조사\드론" --dslr "D:\조사\DSLR" -o "D:\조사\결과.csv" --map "D:\조사\사진지도.html" --geojson "D:\조사\결과.geojson"
 
-# 일반 입력 (-i: EXIF 메타데이터로 드론/DSLR 자동 판별)
-ExifToolArchaeo.exe -i D:\지표조사\드론사진 -o D:\결과.csv --crs tm --map D:\현장위치도.html
+# 여러 입력 폴더·하위 폴더 처리
+python archaeo_gps.py --dslr "D:\조사\1일차" --dslr "D:\조사\2일차" -r -o "D:\조사\결과.csv"
 
-# 하위 폴더까지 모두 훑고(하위 폴더별 색상 구분) QGIS용 GeoJSON도 함께 저장
-ExifToolArchaeo.exe --drone D:\지표조사\드론 --dslr D:\지표조사\DSLR -o D:\결과.csv -r --geojson D:\결과.geojson
+# 장비 자동 분류, 썸네일 없이 지도 생성
+python archaeo_gps.py -i ./photos -r -o result.csv --map map.html --thumb-size 0
 
-# 사진이 아주 많을 때: 썸네일을 빼서 지도 파일 용량을 크게 줄임
-ExifToolArchaeo.exe --drone D:\지표조사\드론사진 -o D:\결과.csv --map D:\지도.html --thumb-size 0
+# WGS84만 출력 / 좌표계 코드 직접 지정
+python archaeo_gps.py -i ./photos -o result.csv --no-transform
+python archaeo_gps.py -i ./photos -o result.csv --crs epsg:5186
+python archaeo_gps.py --list-crs
 ```
-
-#### 주요 옵션
 
 | 옵션 | 설명 |
-| :--- | :--- |
-| `--drone` | 드론 사진 폴더/파일 경로 (여러 번 지정 가능, 지도에 **점 + 방향 화살표** 표시) |
-| `--dslr` | DSLR/일반 사진 폴더/파일 경로 (여러 번 지정 가능, 지도에 **화살표 없이 점만** 표시) |
-| `-i`, `--input` | 일반 입력 폴더/파일 경로 (여러 번 지정 가능, EXIF로 드론/DSLR 자동 판별) |
-| `-o`, `--output` | 출력 CSV 경로 |
-| `-r`, `--recursive` | 하위 폴더까지 재귀 탐색 (하위 폴더별로 점 색상 자동 구분) |
-| `--crs` | 출력 좌표계 (기본 `tm` = EPSG:5186) |
-| `--map` | Leaflet HTML 지도 출력 경로 |
-| `--geojson` | GeoJSON(WGS84) 출력 경로 |
-| `--thumb-size PX` | 지도 썸네일 최대 크기 (기본 640, `0`이면 썸네일 생략) |
-| `--exiftool` | exiftool 실행 파일 경로 직접 지정 |
-| `--no-transform` | 좌표 변환 없이 WGS84만 출력 |
-| `--list-crs` | 지원 좌표계 목록 출력 후 종료 |
-| `--version` | 버전 출력 |
+| --- | --- |
+| `--drone`, `--dslr` | 장비 종류를 지정하는 폴더·파일 입력. 반복 사용 가능 |
+| `-i`, `--input` | 메타데이터로 장비 종류를 자동 분류. 반복 사용 가능 |
+| `-o`, `--output` | CSV 출력 경로 |
+| `-r`, `--recursive` | 하위 폴더 탐색 |
+| `--crs` | 대상 좌표계 별칭 또는 EPSG 코드. 기본 `tm` = EPSG:5186 |
+| `--no-transform` | 투영 좌표 변환 생략 |
+| `--map`, `--geojson` | HTML 지도·GeoJSON 출력 경로 |
+| `--thumb-size` | 썸네일 최대 크기. 기본 640, 0이면 생략 |
+| `--exiftool` | ExifTool 실행 파일 또는 폴더 지정 |
+| `--list-crs`, `--version` | 좌표계 목록·버전 표시 |
 
----
+프로그램에서 직접 호출할 때는 `run_exiftool(path, images, batch_size=500, progress=callback)`으로 배치 크기와 진행 콜백을 지정할 수 있습니다. 기존 두 인자 호출도 유지됩니다. GUI는 공통 추출·검증·출력 함수를 그대로 사용합니다.
 
-## 🧪 테스트 (개발자용)
+## 좌표계와 현장 적용
 
-커스텀 파싱 로직(좌표 변환, 방위각 계산, 파일 수집, 출력 포맷)에 대한 단위 테스트가 포함되어 있습니다.
-ExifTool 실행 파일이나 실제 사진 없이도 동작합니다:
+주요 별칭은 `tm` = EPSG:5186, `tm_west` = EPSG:5185, `tm_east` = EPSG:5187, `tm_eastsea` = EPSG:5188, `utmk` = EPSG:5179입니다. **기본값이 모든 현장 도면에 맞는 것은 아닙니다.** 현장 기준점과 도면의 정확한 EPSG 코드를 확인하세요.
+
+CSV의 `Proj_X`는 동향(Easting), `Proj_Y`는 북향(Northing)입니다. 국내 측량에서 X를 북향, Y를 동향으로 표기하는 도면·장비에 입력할 때는 열 순서를 확인해야 합니다. GeoJSON에는 `[경도, 위도]`를 저장하고 별도의 CRS 멤버를 붙이지 않습니다.
+
+과거 버전의 `tm_mod`, `tm_mod_west`, `tm_mod_east` 별칭은 호환성을 위해 각각 EPSG:5181, 5182, 5183을 유지합니다. 이름만으로 지리적 범위나 Bessel 좌표계를 판단하지 말고 **EPSG 코드 자체를 기준으로 선택**하세요.
+
+현장에 나가기 전에는 원본 사진 몇 장을 실제로 처리해 GPS 포함 여부를 확인하세요. 카메라·휴대전화의 시계와 연결 상태도 확인해야 합니다. GPS 시각 등을 결과에 보존하지만 위치정보가 최신인지, 기록된 수평오차가 실제 오차를 대표하는지를 자동으로 보장하지 않습니다.
+
+HTML의 지도 타일과 Leaflet 라이브러리는 외부 서버에서 가져오므로 인터넷이 필요합니다. HTML에는 사진 썸네일과 위치가, CSV·GeoJSON에는 원본 경로가 포함될 수 있으므로 조사자료를 공유하기 전에 내용을 확인하세요.
+
+## 테스트
 
 ```bash
-python -m unittest test_archaeo_gps -v
+# 기존 테스트 + 품질·배치·출력 회귀 테스트
+python -m unittest discover -p "test_archaeo*.py" -v
 ```
 
----
+ExifTool 실행 파일이나 실사 사진 없이 수행할 수 있습니다. 배치 호출은 모의 프로세스로 검증하며, `pyproj`가 있으면 실제 좌표 변환 왕복 테스트도 실행합니다. Node.js가 있으면 생성된 지도 JavaScript 문법과 DSLR 방향 토글의 아이콘 동작도 확인합니다. 선택 도구가 없는 경우 해당 테스트는 건너뜁니다.
 
-## 🏛️ 라이선스 (License)
+실제 D5600·DJI 사진, Windows 실행 파일, 현장 GPS 오차, 외부 지도 타일은 별도의 통합 검증 대상입니다. **GPX 기반 사후 위치 보완, 자북 편각 보정, 자동 실패 재시도는 이번 버전에 포함되지 않습니다.**
 
-*   이 프로그램의 핵심 엔진은 Phil Harvey의 오픈소스 **[ExifTool](https://github.com/exiftool/exiftool)**을 호출하여 동작하며, ExifTool은 Perl License 규격을 따릅니다.
-*   고고학 전용 GPS 파싱 및 시각화용 커스텀 코드(`archaeo_gps.py`, `archaeo_gps_gui.py`)는 **MIT License** 하에 자유롭게 활용 및 수정 배포할 수 있습니다.
+## 라이선스
+
+ExifTool 엔진과 그 배포 파일의 라이선스는 원본 ExifTool 문서 및 저장소의 라이선스 파일을 따릅니다. 고고학 전용 커스텀 코드의 MIT 라이선스 안내는 기존 배포 정책을 유지합니다. 엔진과 커스텀 코드를 함께 재배포할 때는 각각의 조건을 확인하세요.

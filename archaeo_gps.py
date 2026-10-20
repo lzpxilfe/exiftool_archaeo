@@ -16,6 +16,7 @@ Usage:
 import argparse
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -23,7 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Windows 콘솔 UTF-8 강제 (이모지·한글 출력)
 # console=False exe 에서는 stdout/stderr 가 None 이므로 반드시 None 체크 필요
@@ -75,6 +76,7 @@ SUPPORTED_EXT = {
 }
 
 # ── 동작 파라미터 (하드코딩 대신 한 곳에서 관리) ────────────────────────────
+EXIFTOOL_BATCH_SIZE = 500       # 한 번에 디코딩하는 EXIF JSON의 크기를 제한
 EXIFTOOL_TIMEOUT_BASE = 30      # ExifTool 배치 실행 기본 타임아웃(초)
 EXIFTOOL_TIMEOUT_PER_IMAGE = 0.15  # 이미지 1장당 추가 허용 시간(초)
 EXIFTOOL_TIMEOUT_MAX = 900      # 타임아웃 상한(초)
@@ -124,6 +126,9 @@ EXIF_TAGS = [
     "GPSImgDirection", "GPSImgDirectionRef",
     "GPSSpeed", "GPSSpeedRef",
     "GPSTrack", "GPSTrackRef",
+    "GPSHPositioningError", "GPSDOP", "GPSStatus", "GPSMeasureMode",
+    "GPSSatellites", "GPSMapDatum", "GPSProcessingMethod",
+    "GPSDateStamp", "GPSTimeStamp", "OffsetTimeOriginal",
 ]
 
 # Cardinal direction labels (16-point compass)
@@ -170,93 +175,147 @@ CRS_PRESETS = {
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def dms_to_dd(dms_str: str) -> float | None:
+def dms_to_dd(dms_str) -> float | None:
+    """Parse a finite decimal/DMS coordinate; reject malformed or overflowing DMS.
+
+    Axis-specific ranges and hemisphere refs are checked by parse_record().
+    Decimal output is not rounded here: representation is not GPS accuracy.
     """
-    Convert ExifTool DMS or decimal string to Decimal Degrees.
-    Handles:
-      '36 deg 22' 14.45" N'
-      '36.371791666'          (already decimal)
-      '36.371791666 N'        (decimal with hemisphere)
-      '-33 deg 52' 07.68"'    (signed DMS)
-    Returns None on failure.
-    """
-    if dms_str is None:
+    if dms_str is None or isinstance(dms_str, bool):
         return None
     s = str(dms_str).strip()
-    if not s:
+    number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    dec = re.fullmatch(rf"({number})\s*°?\s*([NSEW])?", s, re.IGNORECASE)
+    if dec:
+        value = _to_float(dec.group(1))
+        hemi = (dec.group(2) or "").upper()
+    else:
+        dms = re.fullmatch(
+            r"([+-]?\d+)\s*(?:deg|°)\s*(\d+)['′]\s*"
+            r"(\d+(?:\.\d*)?)[\"″]\s*([NSEW])?", s, re.IGNORECASE,
+        )
+        if not dms:
+            return None
+        deg_s, minute_s, second_s, hemi = dms.groups()
+        degrees, minutes, seconds = map(_to_float, (deg_s, minute_s, second_s))
+        if degrees is None or minutes is None or seconds is None:
+            return None
+        if not (0 <= minutes < 60 and 0 <= seconds < 60):
+            return None
+        value = abs(degrees) + minutes / 60 + seconds / 3600
+        if deg_s.startswith("-"):
+            value = -value
+        hemi = (hemi or "").upper()
+    if value is None or not math.isfinite(value):
         return None
-
-    # 1) Plain decimal or decimal with optional ° and trailing hemisphere (e.g. "36.3717° N")
-    dec_m = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*°?\s*([NSEW])?", s, re.IGNORECASE)
-    if dec_m:
-        val = float(dec_m.group(1))
-        hemi = dec_m.group(2)
-        if hemi and hemi.upper() in ("S", "W"):
-            val = -abs(val)
-        return val
-
-    # 2) DMS pattern: 36 deg 22' 14.45" N
-    pattern = r"""
-        ([+-]?\d+)\s*deg\s+ # degrees (optional sign)
-        (\d+)['′]\s*        # minutes
-        ([\d.]+)[\"″]\s*    # seconds
-        ([NSEW])?           # optional hemisphere
-    """
-    m = re.search(pattern, s, re.VERBOSE | re.IGNORECASE)
-    if not m:
-        return None
-
-    deg_s, mn, sec, hemi = m.groups()
-    sign = -1.0 if deg_s.startswith("-") else 1.0
-    dd = abs(float(deg_s)) + float(mn) / 60.0 + float(sec) / 3600.0
-    dd *= sign
-
-    if hemi and hemi.upper() in ("S", "W"):
-        dd = -abs(dd)
-    return dd
+    if hemi in ("S", "W"):
+        value = -abs(value)
+    elif hemi in ("N", "E") and value < 0:
+        return None  # Contradictory sign and explicit hemisphere.
+    return value
 
 
 def altitude_to_float(alt_str, alt_ref=None) -> float | None:
-    """ExifTool 고도 문자열에서 숫자를 추출한다.
-
-    '525.2 m Above Sea Level' -> 525.2
-    '12.5 m Below Sea Level'  -> -12.5   (해수면 아래는 음수로 변환)
-
-    alt_ref 는 GPSAltitudeRef (0=Above, 1=Below) 값으로, 문자열에 방향
-    표기가 없는 경우(-n 옵션 등)의 보조 판단에 쓰인다.
-    """
-    if alt_str is None:
+    """Read a finite altitude, honoring EXIF's below-sea-level flag."""
+    if alt_str is None or isinstance(alt_str, bool):
         return None
-    m = re.search(r"(-?\d+(?:\.\d+)?)", str(alt_str))
+    m = re.fullmatch(
+        r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+        r"\s*(?:m(?:eters?)?)?(?:\s+(Above|Below) Sea Level)?\s*",
+        str(alt_str), re.IGNORECASE,
+    )
     if not m:
         return None
-    val = float(m.group(1))
-
-    below = "below sea level" in str(alt_str).lower()
-    if not below and alt_ref is not None:
-        ref_s = str(alt_ref).strip().lower()
-        below = ref_s.startswith("1") or "below" in ref_s
-
-    if below:
-        val = -abs(val)
-    return val
+    value = _to_float(m.group(1))
+    if value is None:
+        return None
+    text_ref = (m.group(2) or "").lower()
+    ref = str(alt_ref or "").strip().lower()
+    below = text_ref == "below" or (not text_ref and (ref == "1" or "below" in ref))
+    return -abs(value) if below else value
 
 
 def deg_to_cardinal(deg: float | None, points: int = 16) -> str:
     """Convert bearing angle (0–360) to compass cardinal label."""
+    deg = _to_float(deg)
     if deg is None:
         return ""
     deg = deg % 360
     labels = CARDINALS_16 if points == 16 else ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
-    idx = round(deg / (360 / len(labels))) % len(labels)
+    idx = math.floor(deg / (360 / len(labels)) + 0.5) % len(labels)
     return labels[idx]
 
 
 def normalize_yaw(yaw: float | None) -> float | None:
     """Normalize yaw to 0–360 (DJI uses -180 to +180)."""
+    yaw = _to_float(yaw)
     if yaw is None:
         return None
     return yaw % 360
+
+
+def valid_coordinates(lat, lon) -> bool:
+    """Only finite numeric WGS84 latitude/longitude pairs are spatial data."""
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return False
+    lat, lon = _to_float(lat), _to_float(lon)
+    return (lat is not None and lon is not None
+            and -90 <= lat <= 90 and -180 <= lon <= 180)
+
+
+def _coordinate_with_ref(value, ref, axis: str) -> float | None:
+    """Validate hemisphere spelling, axis and conflicting embedded refs."""
+    parsed = dms_to_dd(value)
+    if parsed is None:
+        return None
+    refs = {"N": "N", "NORTH": "N", "S": "S", "SOUTH": "S",
+            "E": "E", "EAST": "E", "W": "W", "WEST": "W"}
+    ref_text = str(ref or "").strip().upper()
+    direction = refs.get(ref_text, "")
+    embedded = re.search(r"([NSEW])\s*$", str(value), re.IGNORECASE)
+    embedded = embedded.group(1).upper() if embedded else ""
+    allowed = "NS" if axis == "lat" else "EW"
+    if ref_text and not direction:
+        return None
+    if direction and direction not in allowed or embedded and embedded not in allowed:
+        return None
+    if embedded and direction and embedded != direction:
+        return None
+    direction = embedded or direction
+    if parsed < 0 and direction in ("N", "E"):
+        return None
+    if direction in ("S", "W"):
+        parsed = -abs(parsed)
+    limit = 90 if axis == "lat" else 180
+    return parsed if -limit <= parsed <= limit else None
+
+
+def _north_reference(value) -> str:
+    ref = str(value or "").strip().lower()
+    if ref in ("t", "true", "true north"):
+        return "T"
+    if ref in ("m", "magnetic", "magnetic north"):
+        return "M"
+    return "U"
+
+
+def _json_safe(value):
+    """Keep external numeric metadata from emitting non-standard JSON tokens."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _script_json(value) -> str:
+    """JSON safe inside an HTML script element, including hostile folder names."""
+    return (json.dumps(_json_safe(value), ensure_ascii=False, allow_nan=False,
+                       separators=(",", ":"))
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
 
 
 EXIFTOOL_NAMES = ("exiftool.exe", "exiftool")
@@ -426,7 +485,35 @@ def get_short_path_name(long_name: str) -> str:
         return long_name
 
 
-def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict], list[str]]:
+def run_exiftool(exiftool_path: str, image_paths: list[str],
+                 batch_size: int = EXIFTOOL_BATCH_SIZE,
+                 progress=None) -> tuple[list[dict], list[str]]:
+    """Read bounded batches; a failed batch does not discard earlier successes.
+
+    Return all records plus warnings. Final records/thumbnails still consume
+    memory proportional to the input; this is not a streaming map exporter.
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    records, errors, safe_paths = [], [], []
+    for path in image_paths:
+        # -@ is newline-delimited: do not allow a filename to become an option.
+        if any(c in str(path) for c in ("\r", "\n", "\0")):
+            errors.append(f"ExifTool 경로 거부 (제어문자 포함): {path!r}")
+        else:
+            safe_paths.append(path)
+    total = len(safe_paths)
+    for start in range(0, total, batch_size):
+        chunk = safe_paths[start:start + batch_size]
+        result, warnings = _run_exiftool_batch(exiftool_path, chunk)
+        records.extend(result)
+        errors.extend(f"배치 {start // batch_size + 1}: {w}" for w in warnings)
+        if progress:
+            progress(min(start + len(chunk), total), total)
+    return records, errors
+
+
+def _run_exiftool_batch(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict], list[str]]:
     """Run exiftool in batch mode using an argument file (-@) with UTF-8 encoding.
     This is the official ExifTool recommendation to bypass Windows Unicode / CJK filename issues.
     Returns (results, errors).
@@ -449,6 +536,7 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
     try:
         # 윈도우 락 우회를 위해 delete=False 적용 후 블록 내에서 수동 기록
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.args', delete=False) as f:
+            temp_file_path = f.name
             # tag 인자들 먼저 기재
             for tag in tag_args:
                 f.write(tag + "\n")
@@ -456,12 +544,11 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
             for path in image_paths:
                 abs_path = str(Path(path).resolve().absolute())
                 f.write(abs_path + "\n")
-            temp_file_path = f.name
             
         # block을 나왔으므로 f.close() 되어 윈도우 파일 잠금 해제됨!
         
         # 2. ExifTool 일괄 실행 (Batch mode)
-        # -c "%d deg %d' %.6f\"" 로 초 소수점 6자리(~0.03mm) 정밀도를 유지한다.
+        # DMS 초 소수점 6자리를 보존한다. 이는 측정 정확도 보장이 아니다.
         cmd = [
             exiftool_path,
             "-json",
@@ -494,16 +581,21 @@ def run_exiftool(exiftool_path: str, image_paths: list[str]) -> tuple[list[dict]
                 if isinstance(data, list):
                     # 반환된 리스트의 SourceFile 경로들을 시스템 절대경로와 일치시킴
                     for rec in data:
-                        if "SourceFile" in rec:
-                            sf_normalized = str(Path(rec["SourceFile"]).resolve().absolute())
-                            rec["SourceFile"] = sf_normalized
-                    results = data
+                        if not isinstance(rec, dict):
+                            errors.append("ExifTool 레코드 형식 오류 (객체 아님)")
+                            continue
+                        if rec.get("SourceFile"):
+                            rec["SourceFile"] = str(Path(rec["SourceFile"]).resolve())
+                        for key in ("Error", "Warning"):
+                            if rec.get(key):
+                                errors.append(f"{rec.get('SourceFile', '?')}: {key}: {rec[key]}")
+                        results.append(rec)
                 else:
                     errors.append("ExifTool 반환 데이터 형식 오류 (JSON 리스트 아님)")
             except json.JSONDecodeError as je:
                 errors.append(f"JSON 파싱 실패: {je}\n출력: {result.stdout[:300]}")
-            # 일부 파일 읽기 실패(returncode == 1) 시 stderr 경고를 누락하지 않고 전달
-            if result.returncode == 1 and result.stderr and result.stderr.strip():
+            # 성공 코드에도 출력될 수 있는 경고를 보존한다.
+            if result.stderr and result.stderr.strip():
                 for line in result.stderr.strip().splitlines():
                     if line.strip():
                         errors.append(f"ExifTool 부분 경고: {line.strip()}")
@@ -630,10 +722,12 @@ def build_transformers(target_crs: str) -> tuple | None:
 
 def transform_coords(transformer, lat: float, lon: float) -> tuple[float | None, float | None]:
     """Transform WGS84 lat/lon to target CRS. Returns (x, y)."""
-    if transformer is None or lat is None or lon is None:
+    if transformer is None or not valid_coordinates(lat, lon):
         return None, None
     try:
-        x, y = transformer.transform(lon, lat)
+        x, y = transformer.transform(lon, lat, errcheck=True)
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return None, None
         return x, y
     except Exception:
         return None, None
@@ -681,67 +775,91 @@ def parse_record(
             resolved_folder = ""
     r["Folder"] = str(resolved_folder) if resolved_folder else "기본"
 
-    # GPS coordinates
-    lat_raw = raw.get("GPSLatitude")
-    lon_raw = raw.get("GPSLongitude")
-
-    lat = dms_to_dd(lat_raw)
-    lon = dms_to_dd(lon_raw)
-
-    # Apply hemisphere refs if not embedded in string ("S"/"South", "W"/"West" 모두 처리)
-    if lat is not None and lat > 0:
-        lat_ref = str(raw.get("GPSLatitudeRef", "N")).strip().upper()
-        if lat_ref.startswith("S"):
-            lat = -lat
-
-    if lon is not None and lon > 0:
-        lon_ref = str(raw.get("GPSLongitudeRef", "E")).strip().upper()
-        if lon_ref.startswith("W"):
-            lon = -lon
-
-    r["Lat_DD"] = round(lat, 8) if lat is not None else None
-    r["Lon_DD"] = round(lon, 8) if lon is not None else None
+    # Keep source measurements and quality metadata even when coordinates fail.
+    lat_raw, lon_raw = raw.get("GPSLatitude"), raw.get("GPSLongitude")
+    for tag in ("GPSLatitude", "GPSLongitude", "GPSLatitudeRef", "GPSLongitudeRef"):
+        r[tag + "_raw"] = "" if raw.get(tag) is None else str(raw[tag])
+    lat = _coordinate_with_ref(lat_raw, raw.get("GPSLatitudeRef"), "lat")
+    lon = _coordinate_with_ref(lon_raw, raw.get("GPSLongitudeRef"), "lon")
+    present_lat = lat_raw is not None and str(lat_raw).strip() != ""
+    present_lon = lon_raw is not None and str(lon_raw).strip() != ""
+    warnings = []
+    if not present_lat and not present_lon:
+        status = "missing"
+    elif not present_lat or not present_lon:
+        status = "incomplete"
+        warnings.append("incomplete_coordinate_pair")
+    elif not valid_coordinates(lat, lon):
+        status = "invalid"
+        warnings.append("invalid_coordinate_or_hemisphere")
+    else:
+        status = "valid"
+        if lat == 0 and lon == 0:
+            warnings.append("zero_coordinate_pair_check_required")
+    gps_status = str(raw.get("GPSStatus") or "").strip()
+    if gps_status.lower() in ("v", "measurement void", "void"):
+        status = "invalid"
+        warnings.append("gps_measurement_void")
+    if status != "valid":
+        lat, lon = None, None
+    # Do not round a source coordinate to eight decimals before export.
+    r["Lat_DD"], r["Lon_DD"] = lat, lon
     r["Alt_m"] = altitude_to_float(raw.get("GPSAltitude"), raw.get("GPSAltitudeRef"))
+    r["GPSValidation"] = status
+    r["GPSPositionSource"] = "EXIF" if present_lat or present_lon else ""
+    r["GPSStatus"] = gps_status
+    for tag in ("GPSDateStamp", "GPSTimeStamp", "GPSMapDatum", "GPSProcessingMethod",
+                "GPSMeasureMode", "GPSSatellites", "OffsetTimeOriginal"):
+        r[tag] = str(raw.get(tag) or "")
+    error_m = altitude_to_float(raw.get("GPSHPositioningError"))
+    r["GPSHPositioningError_m"] = error_m if error_m is not None and error_m >= 0 else None
+    dop = _to_float(raw.get("GPSDOP"))
+    r["GPSDOP"] = dop if dop is not None and dop >= 0 else None
+    # A metadata container is not proof of which device supplied the GPS fix.
+    r["GPSWarnings"] = "; ".join(warnings)
+    r["ExifToolError"] = str(raw.get("Error") or "")
+    r["ExifToolWarning"] = str(raw.get("Warning") or "")
 
-    # ----------------------------------------------------------------
-    # Direction / orientation
-    # Priority: DJI Gimbal > DJI Flight > EXIF GPSImgDirection
-    # ----------------------------------------------------------------
-    gimbal_yaw   = _to_float(raw.get("GimbalYawDegree"))
-    gimbal_pitch = _to_float(raw.get("GimbalPitchDegree"))
-    gimbal_roll  = _to_float(raw.get("GimbalRollDegree"))
-    flight_yaw   = _to_float(raw.get("FlightYawDegree"))
-    flight_pitch = _to_float(raw.get("FlightPitchDegree"))
-    flight_roll  = _to_float(raw.get("FlightRollDegree"))
-    gps_dir      = _to_float(raw.get("GPSImgDirection"))
-    gps_dir_ref  = str(raw.get("GPSImgDirectionRef", "")).strip()
-
-    r["GimbalYaw"]   = round(gimbal_yaw, 2)   if gimbal_yaw   is not None else None
-    r["GimbalPitch"] = round(gimbal_pitch, 2) if gimbal_pitch is not None else None
-    r["GimbalRoll"]  = round(gimbal_roll, 2)  if gimbal_roll  is not None else None
-    r["FlightYaw"]   = round(flight_yaw, 2)   if flight_yaw   is not None else None
-    r["FlightPitch"] = round(flight_pitch, 2) if flight_pitch is not None else None
-    r["FlightRoll"]  = round(flight_roll, 2)  if flight_roll  is not None else None
-    r["GPSImgDirection"]    = round(gps_dir, 2) if gps_dir is not None else None
-    r["GPSImgDirectionRef"] = gps_dir_ref
-
-    # Camera pointing direction (best available)
-    cam_dir = gimbal_yaw if gimbal_yaw is not None else (
-              flight_yaw if flight_yaw is not None else gps_dir)
-    cam_dir_norm = normalize_yaw(cam_dir)
-    r["CamDirection_deg"]      = round(cam_dir_norm, 2) if cam_dir_norm is not None else None
-    r["CamDirection_cardinal"] = deg_to_cardinal(cam_dir_norm)
+    # Camera orientation: gimbal > image direction. Flight yaw is NOT camera yaw.
+    for prefix in ("Gimbal", "Flight"):
+        for axis in ("Yaw", "Pitch", "Roll"):
+            r[prefix + axis] = _to_float(raw.get(prefix + axis + "Degree"))
+    gps_dir = _to_float(raw.get("GPSImgDirection"))
+    if gps_dir is not None and not 0 <= gps_dir <= 360:
+        gps_dir = None
+    r["GPSImgDirection"] = gps_dir
+    r["GPSImgDirectionRef"] = str(raw.get("GPSImgDirectionRef") or "").strip()
+    if r["GimbalYaw"] is not None:
+        cam_dir, source, reference = r["GimbalYaw"], "GimbalYawDegree", "U"
+    elif gps_dir is not None:
+        cam_dir, source = gps_dir, "GPSImgDirection"
+        reference = _north_reference(r["GPSImgDirectionRef"])
+    else:
+        cam_dir, source, reference = None, "", "U"
+    direction_warnings = []
+    if cam_dir is None and r["FlightYaw"] is not None:
+        direction_warnings.append("flight_heading_is_not_camera_direction")
+    if cam_dir is not None and reference == "U":
+        direction_warnings.append("north_reference_unverified")
+    if cam_dir is not None and reference == "M":
+        direction_warnings.append("magnetic_north_not_corrected")
+    r["CamDirection_deg"] = normalize_yaw(cam_dir)
+    r["CamDirection_cardinal"] = deg_to_cardinal(r["CamDirection_deg"])
+    r["CamDirectionSource"] = source
+    r["CamDirectionReference"] = reference
+    r["CamDirectionWarnings"] = "; ".join(direction_warnings)
 
     return r
 
 
 def _to_float(val) -> float | None:
-    """Safe float conversion."""
-    if val is None:
+    """Finite numeric conversion (booleans are not measurements)."""
+    if val is None or isinstance(val, bool):
         return None
     try:
-        return float(val)
-    except (ValueError, TypeError):
+        number = float(val)
+        return number if math.isfinite(number) else None
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -895,6 +1013,12 @@ CSV_COLUMNS = [
     "GPSImgDirection", "GPSImgDirectionRef",
     "Proj_X", "Proj_Y", "Proj_CRS",
     "SourceFile",
+    "GPSValidation", "GPSWarnings", "GPSPositionSource",
+    "GPSLatitude_raw", "GPSLongitude_raw", "GPSLatitudeRef_raw", "GPSLongitudeRef_raw",
+    "GPSStatus", "GPSHPositioningError_m", "GPSDOP", "GPSMeasureMode", "GPSSatellites",
+    "GPSMapDatum", "GPSProcessingMethod", "GPSDateStamp", "GPSTimeStamp", "OffsetTimeOriginal",
+    "CamDirectionSource", "CamDirectionReference", "CamDirectionWarnings",
+    "ExifToolError", "ExifToolWarning",
 ]
 
 
@@ -918,6 +1042,7 @@ def write_csv(records: list[dict], output_path: str, transformer=None, target_cr
         row["Proj_CRS"] = target_crs if (x is not None) else ""
         rows.append(row)
 
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
@@ -937,7 +1062,7 @@ def write_geojson(records: list[dict], output_path: str) -> bool:
     feats = []
     for rec in records:
         lat, lon = rec.get("Lat_DD"), rec.get("Lon_DD")
-        if lat is None or lon is None:
+        if not valid_coordinates(lat, lon):
             continue
         props = {k: v for k, v in rec.items() if k not in ("Lat_DD", "Lon_DD")}
         feats.append({
@@ -956,7 +1081,7 @@ def write_geojson(records: list[dict], output_path: str) -> bool:
     # GeoJSON(RFC 7946) 은 항상 WGS84 경위도이므로 crs 멤버를 붙이지 않는다.
     payload = {"type": "FeatureCollection", "features": feats}
     out.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=1),
+        json.dumps(_json_safe(payload), ensure_ascii=False, indent=1, allow_nan=False),
         encoding="utf-8",
     )
     print(f"🌍 GeoJSON 저장: {output_path}  ({len(feats)}개 지점)")
@@ -975,8 +1100,7 @@ def write_map(records: list[dict], output_path: str,
     """
     Generate a Leaflet.js HTML map with:
       - Per-folder color & symbol differentiation
-      - Drone vs DSLR marker differentiation (only Drone markers show directional arrows;
-        DSLR markers render as compact dots so dense excavation shots don't clutter)
+      - Drone vs DSLR markers; DSLR defaults to dots with an optional direction toggle
       - Compact, non-occluding marker design + real-time size/opacity sliders & 'H' hide key
       - Side panel layout & Zoomable/Pannable photo Lightbox
       - Independent tile layer instances (fixing blank map on base layer switch)
@@ -985,7 +1109,7 @@ def write_map(records: list[dict], output_path: str,
     Returns: 지도를 실제로 저장했으면 True, 표시할 GPS 데이터가 없으면 False
     """
     plotted = [r for r in records
-               if r.get("Lat_DD") is not None and r.get("Lon_DD") is not None]
+               if valid_coordinates(r.get("Lat_DD"), r.get("Lon_DD"))]
     if not plotted:
         print("⚠️  지도에 표시할 GPS 데이터가 없습니다.", file=sys.stderr)
         return False
@@ -1012,7 +1136,7 @@ def write_map(records: list[dict], output_path: str,
         lat = rec.get("Lat_DD")
         lon = rec.get("Lon_DD")
 
-        yaw          = rec.get("CamDirection_deg")
+        yaw          = normalize_yaw(rec.get("CamDirection_deg"))
         card         = rec.get("CamDirection_cardinal", "")
         fname        = rec.get("FileName", "")
         source_file  = rec.get("SourceFile", "")
@@ -1050,7 +1174,7 @@ def write_map(records: list[dict], output_path: str,
                 shape = dslr_shapes[dslr_folder_idx % len(dslr_shapes)]
                 dslr_folder_idx += 1
             folder_groups[group_key] = {
-                "key": group_key,
+                "key": f"group-{len(folder_groups)}",
                 "cam_type": cam_type,
                 "folder": html.escape(raw_folder),
                 "color": color,
@@ -1060,7 +1184,9 @@ def write_map(records: list[dict], output_path: str,
         folder_groups[group_key]["count"] += 1
         grp = folder_groups[group_key]
 
-        yaw_display = f"{yaw}° ({card})" if yaw is not None else "N/A"
+        reference = rec.get("CamDirectionReference", "U")
+        ref_label = {"T": "진북", "M": "자북 · 편각 미보정", "U": "북 기준 미확인"}.get(reference, "북 기준 미확인")
+        yaw_display = html.escape(f"{yaw}° ({card}) · {ref_label}") if yaw is not None else "N/A"
 
         # Nadir check (straight down) — 드론 촬영에만 적용
         is_nadir = False
@@ -1071,8 +1197,9 @@ def write_map(records: list[dict], output_path: str,
             except (ValueError, TypeError):
                 pass
 
-        # 드론만 점에 화살표로 방향을 표시하고, DSLR은 점으로만 표시한다.
-        has_dir = bool(is_drone and (yaw is not None))
+        # 자북을 진북 지도에 그대로 회전하지 않는다. 미확인 기준은 점선으로 구분.
+        direction_available = yaw is not None and reference in ("T", "U")
+        has_dir = bool(is_drone and direction_available)
 
         thumb_b64 = thumbs.get(source_file)
 
@@ -1097,22 +1224,28 @@ def write_map(records: list[dict], output_path: str,
             "lon": lon,
             "yaw": yaw if yaw is not None else 0,
             "has_dir": has_dir,
+            "direction_available": direction_available,
+            "direction_reference": reference if reference in ("T", "M", "U") else "U",
+            "direction_source": html.escape(str(rec.get("CamDirectionSource") or "미기록")),
+            "direction_warnings": html.escape(str(rec.get("CamDirectionWarnings") or "없음")),
+            "gps_warnings": html.escape(str(rec.get("GPSWarnings") or "없음")),
+            "gps_error": html.escape(str(rec.get("GPSHPositioningError_m") if rec.get("GPSHPositioningError_m") is not None else "미기록")),
             "is_nadir": is_nadir,
             "cam_type": cam_type,
-            "group_key": group_key,
+            "group_key": grp["key"],
             "folder": folder_safe,
             "color": grp["color"],
             "shape": grp["shape"],
             "popup": popup_html,
             "fname": fname_safe,
             "dt": html.escape(str(dt)) if dt else "N/A",
-            "alt": alt_val,
+            "alt": html.escape(alt_val),
             "make": html.escape(str(make)) if make else "N/A",
             "model": html.escape(str(model)) if model else "N/A",
-            "gimbal_yaw": gy_val,
-            "gimbal_pitch": gp_val,
-            "gimbal_roll": gr_val,
-            "flight_yaw": fy_val,
+            "gimbal_yaw": html.escape(gy_val),
+            "gimbal_pitch": html.escape(gp_val),
+            "gimbal_roll": html.escape(gr_val),
+            "flight_yaw": html.escape(fy_val),
             "yaw_display": yaw_display,
             "thumb_b64": thumb_b64 if thumb_b64 else "",
         })
@@ -1120,8 +1253,8 @@ def write_map(records: list[dict], output_path: str,
     center_lat = sum(f["lat"] for f in features) / len(features)
     center_lon = sum(f["lon"] for f in features) / len(features)
     # base64 썸네일이 포함되므로 indent 없이 최소 크기로 직렬화한다
-    features_json = json.dumps(features, ensure_ascii=False, separators=(",", ":"))
-    groups_json = json.dumps(list(folder_groups.values()), ensure_ascii=False, separators=(",", ":"))
+    features_json = _script_json(features)
+    groups_json = _script_json(list(folder_groups.values()))
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -1536,8 +1669,8 @@ def write_map(records: list[dict], output_path: str,
 
     // ── 마커 아이콘 팩토리 ───────────────────────────────────────────────────
     // 1. 밀집 구역에서 지도를 가리지 않도록 기존 22px 외곽 배경 원(r=11)을 제거.
-    // 2. 드론(cam_type === 'drone')만 방향 화살표(또는 수직 촬영 과녁)를 표시.
-    // 3. DSLR(cam_type === 'dslr')은 화살표 없이 폴더별 색상/도형 점으로만 깔끔하게 표시.
+    // 2. 드론은 사용 가능한 방향 화살표(또는 수직 촬영 과녁)를 표시.
+    // 3. DSLR은 기본 점 표시, 방향 메타데이터는 선택적으로 표시.
     function renderPointShape(shape, color) {{
       if (shape === 'diamond') {{
         return `<polygon points="14,9.5 18.5,14 14,18.5 9.5,14" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
@@ -1551,6 +1684,8 @@ def write_map(records: list[dict], output_path: str,
       return `<circle cx="14" cy="14" r="4.0" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
     }}
 
+    let showDslrDirections = false;
+
     function makeCustomIcon(f, isSelected = false) {{
       const color = f.color || (f.cam_type === 'drone' ? '#e94560' : '#38bdf8');
       const selRing = isSelected
@@ -1558,7 +1693,7 @@ def write_map(records: list[dict], output_path: str,
         : '';
       let svgBody = '';
 
-      if (f.cam_type === 'drone') {{
+      if (f.cam_type === 'drone' || (showDslrDirections && f.direction_available)) {{
         if (f.is_nadir) {{
           // 드론 수직(Nadir) 촬영: 지도를 가리지 않는 컴팩트 과녁
           svgBody = `
@@ -1567,13 +1702,13 @@ def write_map(records: list[dict], output_path: str,
             <line x1="14" y1="5" x2="14" y2="23" stroke="${{color}}" stroke-width="1" stroke-opacity="0.75"/>
             <line x1="5" y1="14" x2="23" y2="14" stroke="${{color}}" stroke-width="1" stroke-opacity="0.75"/>
             <circle cx="14" cy="14" r="2.6" fill="${{color}}" stroke="#0a0f1e" stroke-width="1"/>`;
-        }} else if (f.has_dir) {{
-          // 드론 경사 촬영: 중심점 + 바라보는 방향 화살표 (배경 큰 원 없음)
+        }} else if (f.has_dir || (showDslrDirections && f.direction_available)) {{
+          // 방향 메타데이터가 있는 사진: 중심점 + 방향 화살표 (배경 큰 원 없음)
           svgBody = `
             ${{selRing}}
             <g transform="rotate(${{f.yaw}},14,14)">
               <line x1="14" y1="14" x2="14" y2="3.2" stroke="#0a0f1e" stroke-width="3.4" stroke-linecap="round"/>
-              <line x1="14" y1="14" x2="14" y2="3.2" stroke="${{color}}" stroke-width="2.0" stroke-linecap="round"/>
+              <line x1="14" y1="14" x2="14" y2="3.2" stroke="${{color}}" stroke-width="2.0" stroke-linecap="round" stroke-dasharray="${{f.direction_reference === 'U' ? '2 2' : 'none'}}"/>
               <polygon points="14,0.8 10.6,7.2 17.4,7.2" fill="${{color}}" stroke="#0a0f1e" stroke-width="0.9"/>
             </g>
             <circle cx="14" cy="14" r="3.4" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.2"/>`;
@@ -1581,7 +1716,7 @@ def write_map(records: list[dict], output_path: str,
           svgBody = `${{selRing}}<circle cx="14" cy="14" r="3.8" fill="${{color}}" stroke="#0a0f1e" stroke-width="1.3"/>`;
         }}
       }} else {{
-        // DSLR / 일반 카메라: 화살표 없이 폴더별 깔끔한 점으로만 표현
+        // 방향 미표시 사진: 폴더별 색상/도형 점으로 표현
         svgBody = `${{selRing}}${{renderPointShape(f.shape, color)}}`;
       }}
 
@@ -1655,12 +1790,14 @@ def write_map(records: list[dict], output_path: str,
       const angleLabel = f.is_nadir ? '<span style="background:#e94560; color:#fff; padding:2px 6px; border-radius:4px; font-size:0.7rem; margin-left:6px; vertical-align:middle;">수직 촬영</span>' : '';
       const coordText = `${{f.lat.toFixed(6)}}, ${{f.lon.toFixed(6)}}`;
 
-      const dirRows = isDrone ? `
+      const dirRows = `
+          <tr><td class="label-col">방향 출처</td><td>${{f.direction_source}}</td></tr>
+          <tr><td class="label-col">방향 주의</td><td>${{f.direction_warnings}}</td></tr>
           <tr><td class="label-col">🧭 촬영 방향</td><td style="font-weight:bold; color:${{f.color}}; font-size:0.9rem;">${{f.yaw_display}}</td></tr>
           <tr><td class="label-col" style="padding-left:15px;">짐벌 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_yaw}}</td></tr>
           <tr><td class="label-col" style="padding-left:15px;">짐벌 Pitch</td><td style="font-family:monospace; color:#e2e8f0;">${{f.gimbal_pitch}}</td></tr>
           <tr><td class="label-col" style="padding-left:15px;">기체 Yaw</td><td style="font-family:monospace; color:#e2e8f0;">${{f.flight_yaw}}</td></tr>
-      ` : '';
+      `;
 
       contentDiv.innerHTML = `
         <div class="nav-bar">
@@ -1678,6 +1815,8 @@ def write_map(records: list[dict], output_path: str,
           <tr><td class="label-col">📂 입력 폴더</td><td style="color:#e2e8f0;">${{f.folder}} (${{isDrone ? '드론' : 'DSLR'}})</td></tr>
           <tr><td class="label-col">📍 위도/경도</td><td><span style="font-family:monospace; font-weight:bold; color:#fff;">${{coordText}}</span> <button class="copy-btn" onclick="copyCoord('${{coordText}}', this)" title="좌표 복사">복사</button></td></tr>
           <tr><td class="label-col">⬆ GPS 고도</td><td style="color:#fff;">${{f.alt}}</td></tr>
+          <tr><td class="label-col">위치 주의</td><td>${{f.gps_warnings}}</td></tr>
+          <tr><td class="label-col">수평오차 (m)</td><td>${{f.gps_error}}</td></tr>
           ${{dirRows}}
           <tr><td class="label-col">📷 카메라 장비</td><td style="color:#fff;">${{f.make}} ${{f.model}}</td></tr>
         </table>
@@ -1814,8 +1953,15 @@ def write_map(records: list[dict], output_path: str,
         <div class="legend-group-list">${{groupItemsHtml}}</div>
         <div style="font-size:0.7rem; color:#94a3b8; margin-bottom:6px; border-top:1px solid #2d3748; padding-top:5px;">
           • <b>드론</b>: 점 + 촬영방향 화살표 (수직촬영은 점선 과녁)<br>
-          • <b>DSLR</b>: 방향 화살표 없이 폴더별 점으로만 표시
+          • <b>DSLR</b>: 기본은 점, 아래에서 방향 표시 선택<br>
+          • 점선 방향: 북 기준 미확인. 자북은 화살표 생략.<br>
+          • 위치는 촬영자 위치이며 피사체 좌표가 아닙니다.
+
         </div>
+        <label class="legend-item">
+          <input id="dslr-direction-toggle" type="checkbox">
+          DSLR 방향 표시 (메타데이터가 있을 때만)
+        </label>
         <div class="ctrl-row">
           <span>마커 크기</span>
           <input id="scale-slider" type="range" min="0.4" max="1.8" step="0.05" value="1.0">
@@ -1834,6 +1980,11 @@ def write_map(records: list[dict], output_path: str,
           else activeGroups.delete(key);
           applyGroupFilter();
         }});
+      }});
+
+      d.querySelector('#dslr-direction-toggle').addEventListener('change', ev => {{
+        showDslrDirections = ev.target.checked;
+        features.forEach((f, i) => markers[i].setIcon(makeCustomIcon(f, i === currentIndex)));
       }});
 
       const scaleSlider = d.querySelector('#scale-slider');
@@ -2013,7 +2164,7 @@ def main():
             )
         )
 
-    gps_ok = sum(1 for r in records if r["Lat_DD"] is not None)
+    gps_ok = sum(1 for r in records if valid_coordinates(r["Lat_DD"], r["Lon_DD"]))
     drone_cnt = sum(1 for r in records if r.get("CameraType") == CAMERA_TYPE_DRONE)
     dslr_cnt = sum(1 for r in records if r.get("CameraType") == CAMERA_TYPE_DSLR)
     dir_ok = sum(
@@ -2024,6 +2175,10 @@ def main():
         f"   GPS 있음: {gps_ok}/{len(records)}장  |  "
         f"드론: {drone_cnt}장 (방향 {dir_ok}장)  |  DSLR: {dslr_cnt}장"
     )
+    quality_warnings = sum(bool(r.get("GPSWarnings") or r.get("CamDirectionWarnings")
+                                or r.get("ExifToolError")) for r in records)
+    if quality_warnings:
+        print(f"   ⚠️ 품질 확인 필요: {quality_warnings}장 (CSV 경고 열 참조)")
     if gps_ok == 0:
         print("⚠️  GPS 좌표가 있는 사진이 없습니다. 좌표 변환과 지도 생성은 생략됩니다.",
               file=sys.stderr)
